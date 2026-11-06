@@ -28,4 +28,5 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
-        run: gh release create "${{ github.ref_name }}" dist/CaptureFacile.exe --title "Capture Facile ${{ github.ref_name }}" --notes "EXE Windows autonome : aucune installation Python requise." --verify-tag
+        run: |
+          gh release create "${{ github.ref_name }}" dist/CaptureFacile.exe --title "Capture Facile ${{ github.ref_name }}" --notes "EXE Windows autonome : aucune installation Python requise." --verify-tag
