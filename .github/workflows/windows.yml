@@ -22,7 +22,7 @@ jobs:
           $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
           if (-not $vs) { throw "Compilateur Visual C++ absent" }
           $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
-          cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /Fe:capture_native.dll native\capture_native.cpp"
+          cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /Fe:capture_native.dll native\capture_native.cpp gdi32.lib user32.lib"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path capture_native.dll)) { throw "DLL native absente" }
           cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /std:c++17 /Fe:capture_dxgi.dll native\capture_dxgi.cpp d3d11.lib dxgi.lib"
