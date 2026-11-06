@@ -4,6 +4,7 @@ Assemble des MP4 autorisés, avec titre, fondus d'entrée, musique facultative.
 Utilise FFmpeg embarqué par imageio-ffmpeg, sans installation externe.
 """
 import os
+import time
 import queue
 import re
 import subprocess
@@ -15,7 +16,7 @@ from tkinter import Listbox, END, SINGLE, filedialog, messagebox
 
 import customtkinter as ctk
 import imageio_ffmpeg
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 BG = '#101523'
 PANEL = '#1A2234'
@@ -78,7 +79,8 @@ def _title_image(text, destination, width, height):
     picture.save(destination, 'PNG')
 
 
-def _normalization_args(ffmpeg, source, out, size, fps, has_audio=True, still=False):
+def _normalization_args(ffmpeg, source, out, size, fps, has_audio=True, still=False,
+                        duration=None, transition="Fondu au noir", clip_volume=1.0):
     width, height = size
     common = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-y']
     if still:
@@ -91,15 +93,23 @@ def _normalization_args(ffmpeg, source, out, size, fps, has_audio=True, still=Fa
             common += ['-f', 'lavfi', '-i', 'anullsrc=channel_layout=stereo:sample_rate=48000']
     vf = (f'scale={width}:{height}:force_original_aspect_ratio=decrease,'
           f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=black,'
-          f'setsar=1,fps={fps},format=yuv420p,fade=t=in:st=0:d=0.25')
+          f'setsar=1,fps={fps},format=yuv420p')
+    if transition == 'Fondu au noir':
+        vf += ',fade=t=in:st=0:d=0.25'
+        if duration and duration > 0.6:
+            vf += f',fade=t=out:st={max(0, duration-0.25):.3f}:d=0.25'
+    af = f'volume={clip_volume:.3f}'
+    if transition == 'Fondu au noir' and duration and duration > 0.6:
+        af += f',afade=t=out:st={max(0, duration-0.25):.3f}:d=0.25'
     common += ['-map', '0:v:0', '-map', '0:a:0' if has_audio and not still else '1:a:0',
-               '-vf', vf, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21',
+               '-vf', vf, '-af', af, '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '21',
                '-pix_fmt', 'yuv420p', '-r', str(fps), '-c:a', 'aac', '-ar', '48000',
                '-ac', '2', '-b:a', '160k', '-shortest', '-movflags', '+faststart', str(out)]
     return common
 
 
-def export_trailer(clips, output, title, music, resolution, fps, on_progress):
+def export_trailer(clips, output, title, music, resolution, fps, on_progress,
+                   transition="Fondu au noir", clip_volume=1.0, music_volume=0.22):
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     width, height = resolution
     with tempfile.TemporaryDirectory(prefix='capture_facile_studio_') as tmp:
@@ -115,10 +125,11 @@ def export_trailer(clips, output, title, music, resolution, fps, on_progress):
             on_progress(f'Préparation du clip {i+1}/{len(sources)}…')
             if not source.is_file():
                 raise RuntimeError(f'Fichier introuvable : {source.name}')
-            has_audio = False if still else _input_info(ffmpeg, source)[1]
+            duration, has_audio = (2.0, False) if still else _input_info(ffmpeg, source)
             normalized_path = work/f'part_{i:03d}.mp4'
             _run(_normalization_args(ffmpeg, source, normalized_path, resolution, fps,
-                                     has_audio=has_audio, still=still))
+                                     has_audio=has_audio, still=still, duration=duration,
+                                     transition=transition, clip_volume=clip_volume))
             normalized.append(normalized_path)
         on_progress('Assemblage des séquences…')
         manifest = work/'sequence.txt'
@@ -130,7 +141,7 @@ def export_trailer(clips, output, title, music, resolution, fps, on_progress):
             on_progress('Mixage de la musique (volume réduit)…')
             _run([ffmpeg, '-hide_banner', '-loglevel', 'error', '-y', '-i', str(assembled),
                   '-stream_loop', '-1', '-i', str(music),
-                  '-filter_complex', '[1:a:0]volume=0.22[m];[0:a:0][m]amix=inputs=2:duration=first:dropout_transition=0[a]',
+                  '-filter_complex', f'[1:a:0]volume={music_volume:.3f}[m];[0:a:0][m]amix=inputs=2:duration=first:dropout_transition=0[a]',
                   '-map', '0:v:0', '-map', '[a]', '-c:v', 'copy', '-c:a', 'aac',
                   '-b:a', '192k', '-movflags', '+faststart', '-shortest', str(output)])
         else:
@@ -143,15 +154,20 @@ def export_trailer(clips, output, title, music, resolution, fps, on_progress):
 class TrailerStudio(ctk.CTkToplevel):
     def __init__(self, master, folder, on_saved):
         super().__init__(master)
-        self.title('Capture Facile • Atelier bande-annonce v12')
-        self.geometry('910x690')
-        self.minsize(700, 580)
+        self.title('Capture Facile • Atelier bande-annonce v13')
+        self.geometry('1050x825')
+        self.minsize(850, 730)
         self.configure(fg_color=BG)
         self.folder = Path(folder)
         self.on_saved = on_saved
         self.clips = []
         self.music = None
         self.running = False
+        self.preview_process = None
+        self.preview_stop = None
+        self.preview_generation = 0
+        self.preview_photo = None
+        self.preview_clip = None
         self.updates = queue.Queue()
         self._build()
         self.after(100, self._poll)
@@ -167,10 +183,11 @@ class TrailerStudio(ctk.CTkToplevel):
         clips_label = ctk.CTkLabel(panel, text='SÉQUENCES (ordre de lecture)',
                                    text_color=TEXT, font=('Segoe UI', 14, 'bold'))
         clips_label.pack(anchor='w', padx=18, pady=(14, 3))
-        self.listbox = Listbox(panel, height=10, selectmode=SINGLE, bg='#232E43', fg='#F2F5FF',
+        self.listbox = Listbox(panel, height=5, selectmode=SINGLE, bg='#232E43', fg='#F2F5FF',
                                selectbackground='#247D78', selectforeground='#FFFFFF',
                                borderwidth=0, highlightthickness=0, font=('Segoe UI', 11))
-        self.listbox.pack(fill='both', expand=True, padx=18, pady=(0, 8))
+        self.listbox.pack(fill='x', padx=18, pady=(0, 8))
+        self.listbox.bind('<<ListboxSelect>>', self._preview_selection)
         buttons = ctk.CTkFrame(panel, fg_color='transparent')
         buttons.pack(fill='x', padx=14, pady=(0, 10))
         for title, fn in [('Ajouter MP4', self.add_clips), ('Monter ↑', lambda: self.move(-1)),
@@ -178,6 +195,22 @@ class TrailerStudio(ctk.CTkToplevel):
                           ('Vider', self.clear)]:
             ctk.CTkButton(buttons, text=title, command=fn, fg_color=CARD, hover_color='#354661',
                           width=105).pack(side='left', padx=4)
+        viewing = ctk.CTkFrame(panel, fg_color=CARD, corner_radius=10)
+        viewing.pack(fill='x', padx=18, pady=(0, 8))
+        self.preview_label = ctk.CTkLabel(viewing, text='Choisissez un clip pour voir son aperçu',
+                                           width=480, height=270, text_color=MUTED)
+        self.preview_label.pack(side='left', padx=10, pady=8)
+        player = ctk.CTkFrame(viewing, fg_color='transparent')
+        player.pack(side='left', fill='both', expand=True, padx=8)
+        self.preview_name = ctk.CTkLabel(player, text='Lecture d’aperçu sans son',
+                                          text_color=MUTED, wraplength=310)
+        self.preview_name.pack(anchor='w', pady=12)
+        ctk.CTkButton(player, text='▶ Lire', command=self.play_preview,
+                      fg_color=ACCENT, text_color=BG, width=130).pack(anchor='w', pady=4)
+        ctk.CTkButton(player, text='■ Arrêter', command=self.stop_preview,
+                      fg_color=PANEL, width=130).pack(anchor='w', pady=4)
+        self.preview_time = ctk.CTkLabel(player, text='00:00', text_color=MUTED)
+        self.preview_time.pack(anchor='w', pady=6)
         settings = ctk.CTkFrame(panel, fg_color='transparent')
         settings.pack(fill='x', padx=18, pady=(3, 9))
         ctk.CTkLabel(settings, text='Titre d’ouverture (facultatif)', text_color=MUTED).grid(row=0,column=0,sticky='w',padx=4)
@@ -201,13 +234,117 @@ class TrailerStudio(ctk.CTkToplevel):
         ctk.CTkOptionMenu(options, values=['30 FPS', '60 FPS'], variable=self.fps_var,
                           width=130).pack(side='left',padx=4)
         settings.grid_columnconfigure(0, weight=1)
-        self.status = ctk.CTkLabel(self, text='Prêt • MP4 H.264 + AAC • fondu d’entrée de chaque plan',
+        levels = ctk.CTkFrame(panel, fg_color='transparent')
+        levels.pack(fill='x', padx=18, pady=(0, 12))
+        ctk.CTkLabel(levels, text='Transition', text_color=MUTED).grid(row=0, column=0, padx=6)
+        self.transition_var = ctk.StringVar(value='Fondu au noir')
+        ctk.CTkOptionMenu(levels, values=['Fondu au noir', 'Coupe franche'],
+                          variable=self.transition_var, width=165).grid(row=1, column=0, padx=6)
+        ctk.CTkLabel(levels, text='Son des clips', text_color=MUTED).grid(row=0, column=1, padx=9)
+        self.clip_volume = ctk.CTkSlider(levels, from_=0, to=1.5, number_of_steps=30, width=150)
+        self.clip_volume.set(1.0)
+        self.clip_volume.grid(row=1, column=1, padx=9)
+        ctk.CTkLabel(levels, text='Musique de fond', text_color=MUTED).grid(row=0, column=2, padx=9)
+        self.music_volume = ctk.CTkSlider(levels, from_=0, to=1, number_of_steps=20, width=150)
+        self.music_volume.set(0.22)
+        self.music_volume.grid(row=1, column=2, padx=9)
+        self.status = ctk.CTkLabel(self, text='Prêt • aperçu sans audio • export H.264 + AAC',
                                    text_color=MUTED)
         self.status.pack(anchor='w', padx=27, pady=(0, 5))
         self.export_button = ctk.CTkButton(self, text='Exporter la bande-annonce MP4', command=self.export,
                                            fg_color=ACCENT, text_color=BG,
                                            height=44, font=('Segoe UI', 14, 'bold'))
         self.export_button.pack(fill='x', padx=24, pady=(0, 18))
+
+    def _stop_player(self):
+        self.preview_generation += 1
+        if self.preview_stop:
+            self.preview_stop.set()
+        proc = self.preview_process
+        if proc and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
+        self.preview_process = None
+        self.preview_stop = None
+
+    def stop_preview(self):
+        self._stop_player()
+        self.preview_time.configure(text='Arrêt')
+
+    def _preview_selection(self, _event=None):
+        selected = self.listbox.curselection()
+        if not selected:
+            return
+        chosen = self.clips[selected[0]]
+        if chosen == self.preview_clip:
+            return
+        self._stop_player()
+        self.preview_clip = chosen
+        self.preview_name.configure(text=chosen.name[:55] + '\nLecture sans son')
+        self.preview_time.configure(text='Aperçu prêt')
+        self.preview_label.configure(image=None, text='▶ Cliquez sur Lire')
+
+    def play_preview(self):
+        selected = self.listbox.curselection()
+        if not selected:
+            return
+        path = self.clips[selected[0]]
+        if not path.is_file():
+            messagebox.showerror('Capture Facile', 'Vidéo introuvable', parent=self)
+            return
+        self._stop_player()
+        generation = self.preview_generation
+        stopped = threading.Event()
+        self.preview_stop = stopped
+        self.preview_name.configure(text=path.name[:55] + '\nLecture d’aperçu sans son')
+        self.preview_time.configure(text='Chargement…')
+        def play():
+            proc = None
+            try:
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+                width, height = 480, 270
+                cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', str(path),
+                       '-an', '-vf', f'fps=12,scale={width}:{height}:force_original_aspect_ratio=decrease,'
+                       f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',
+                       '-pix_fmt', 'rgb24', '-f', 'rawvideo', '-']
+                proc = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL, bufsize=0,
+                                        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                self.preview_process = proc
+                frame_bytes = width * height * 3
+                number = 0
+                start = time.monotonic()
+                while not stopped.is_set():
+                    buf = bytearray()
+                    while len(buf) < frame_bytes and not stopped.is_set():
+                        chunk = proc.stdout.read(frame_bytes - len(buf))
+                        if not chunk:
+                            break
+                        buf.extend(chunk)
+                    if len(buf) != frame_bytes:
+                        break
+                    image = Image.frombytes('RGB', (width, height), bytes(buf))
+                    if number % 2 == 0:
+                        self.updates.put(('preview_frame', (generation, image, number / 12)))
+                    number += 1
+                    deadline = start + number / 12
+                    delay = deadline - time.monotonic()
+                    if delay > 0:
+                        stopped.wait(delay)
+                if not stopped.is_set():
+                    self.updates.put(('preview_end', generation))
+            except Exception as exc:
+                self.updates.put(('preview_error', (generation, str(exc))))
+            finally:
+                if proc:
+                    try:
+                        proc.kill() if proc.poll() is None else None
+                        proc.wait(timeout=2)
+                    except (OSError, subprocess.TimeoutExpired):
+                        pass
+        threading.Thread(target=play, daemon=True).start()
 
     def _refresh(self, selected=None):
         self.listbox.delete(0, END)
@@ -226,6 +363,7 @@ class TrailerStudio(ctk.CTkToplevel):
             if path not in self.clips:
                 self.clips.append(path)
         self._refresh(len(self.clips)-1 if self.clips else None)
+        self._preview_selection()
 
     def move(self, direction):
         selected = self.listbox.curselection()
@@ -236,15 +374,20 @@ class TrailerStudio(ctk.CTkToplevel):
         if 0 <= j < len(self.clips):
             self.clips[i],self.clips[j] = self.clips[j],self.clips[i]
             self._refresh(j)
+            self._preview_selection()
 
     def remove_clip(self):
         selected = self.listbox.curselection()
         if selected:
             i = selected[0]
             self.clips.pop(i)
+            self.preview_clip = None
             self._refresh(i)
+            self._preview_selection()
 
     def clear(self):
+        self._stop_player()
+        self.preview_clip = None
         self.clips.clear()
         self._refresh()
 
@@ -278,6 +421,7 @@ class TrailerStudio(ctk.CTkToplevel):
         if self.music and not self.music.is_file():
             messagebox.showerror('Capture Facile', 'Fichier de musique introuvable.', parent=self)
             return
+        self.stop_preview()
         self.running = True
         self.export_button.configure(state='disabled', text='Export en cours…')
         clips = list(self.clips)
@@ -285,11 +429,15 @@ class TrailerStudio(ctk.CTkToplevel):
         title = self.title_entry.get()
         resolution = (1920,1080) if self.res_var.get() == '1080p' else (1280,720)
         fps = 60 if self.fps_var.get() == '60 FPS' else 30
+        transition = self.transition_var.get()
+        clip_level = self.clip_volume.get()
+        music_level = self.music_volume.get()
 
         def job():
             try:
                 export_trailer(clips, dest, title, music, resolution, fps,
-                               lambda msg: self.updates.put(('progress',msg)))
+                               lambda msg: self.updates.put(('progress',msg)),
+                               transition=transition, clip_volume=clip_level, music_volume=music_level)
                 self.updates.put(('done',dest))
             except Exception as e:
                 # An incomplete MP4 must not be mistaken for a successful export.
@@ -307,6 +455,22 @@ class TrailerStudio(ctk.CTkToplevel):
         try:
             while True:
                 kind, value = self.updates.get_nowait()
+                if kind == 'preview_frame':
+                    generation, frame, t = value
+                    if generation == self.preview_generation:
+                        photo = ImageTk.PhotoImage(frame)
+                        self.preview_photo = photo
+                        self.preview_label.configure(image=photo, text='')
+                        self.preview_time.configure(text=f'{int(t)//60:02d}:{int(t)%60:02d}')
+                    continue
+                if kind == 'preview_end':
+                    if value == self.preview_generation:
+                        self.preview_time.configure(text='Fin de l’aperçu')
+                    continue
+                if kind == 'preview_error':
+                    if value[0] == self.preview_generation:
+                        self.preview_time.configure(text=f'Lecture impossible : {value[1][:55]}')
+                    continue
                 if kind == 'progress':
                     self.status.configure(text=value)
                 else:
@@ -327,6 +491,7 @@ class TrailerStudio(ctk.CTkToplevel):
         if self.running:
             messagebox.showwarning('Capture Facile', 'Attendez la fin de l’export avant de fermer cet atelier.',parent=self)
             return
+        self._stop_player()
         super().destroy()
 
 
