@@ -437,6 +437,38 @@ class CaptureApp(ctk.CTk):
             elif action == "record_idle":
                 self.finalizing_video = False
                 self.record_label.configure(text="●  Aucune vidéo en cours", text_color=MUTED)
+            elif action == "editor_ready":
+                editor, state, duration, start_slider, end_slider, info, export_button, refresh, preview, change_start, change_end = payload
+                if not state["closed"] and editor.winfo_exists():
+                    state["duration"] = duration
+                    state["start"], state["end"] = 0.0, duration
+                    for slider in (start_slider, end_slider):
+                        slider.configure(to=duration, state="normal")
+                    start_slider.set(0)
+                    end_slider.set(duration)
+                    info.configure(text=f"Durée totale : {duration:.1f} s • glissez les curseurs pour choisir l'extrait")
+                    export_button.configure(state="normal")
+                    refresh()
+                    preview(0.0)
+            elif action == "editor_error":
+                editor, state, error, info = payload
+                if not state["closed"] and editor.winfo_exists():
+                    info.configure(text=f"Erreur : {error}")
+            elif action == "editor_frame":
+                editor, state, sequence, frame, label = payload
+                if not state["closed"] and editor.winfo_exists() and sequence == state["seq"]:
+                    preview_image = ctk.CTkImage(light_image=frame, dark_image=frame, size=frame.size)
+                    state["preview_image"] = preview_image
+                    label.configure(image=preview_image, text="")
+            elif action == "editor_frame_error":
+                editor, state, sequence, error, label = payload
+                if not state["closed"] and editor.winfo_exists() and sequence == state["seq"]:
+                    label.configure(text=f"Aperçu indisponible : {error}", image=None)
+            elif action == "editor_export_finished":
+                editor, state, info, button = payload
+                if not state["closed"] and editor.winfo_exists():
+                    info.configure(text="Export terminé. Choisissez un autre extrait si besoin.")
+                    button.configure(state="normal")
             elif action == "trim_done":
                 self.busy = False
                 self._set_status(f"✓ Extrait MP4 enregistré : {payload.name}")
@@ -831,47 +863,172 @@ class CaptureApp(ctk.CTk):
             messagebox.showerror(APP_NAME, f"Sélection de zone impossible : {exc}")
 
     def trim_video(self, path):
-        """Non-destructive MP4 trim with explicit start/end times (seconds)."""
+        """Éditeur temporel non destructif, miniatures récupérées avec FFmpeg."""
         if self.busy or self.recording or self.finalizing_video:
-            self._set_status("Terminez l'opération en cours avant de couper une vidéo.", True)
+            self._set_status("Terminez l'opération en cours avant de monter une vidéo.", True)
             return
-        from tkinter import simpledialog
-        begin = simpledialog.askfloat("Découper une vidéo", "Début en secondes (ex : 3.5) :",
-                                      parent=self, minvalue=0.0)
-        if begin is None:
-            return
-        end = simpledialog.askfloat("Découper une vidéo", "Fin en secondes (ex : 18.0) :",
-                                    parent=self, minvalue=0.0)
-        if end is None:
-            return
-        if end <= begin:
-            messagebox.showwarning(APP_NAME, "La fin doit être supérieure au début.", parent=self)
-            return
-        self.busy = True
-        self._set_status("Export de l'extrait MP4 en cours…")
+        editor = ctk.CTkToplevel(self)
+        editor.title(f"Montage vidéo • {path.name}")
+        editor.geometry("850x690")
+        editor.minsize(620, 560)
+        editor.configure(fg_color=BG)
+        editor.after(120, editor.lift)
+        state = {"closed": False, "duration": 0.0, "seq": 0, "after_id": None,
+                 "start": 0.0, "end": 0.0, "preview_image": None}
 
-        def job():
+        def close():
+            state["closed"] = True
+            if state["after_id"] is not None:
+                try:
+                    editor.after_cancel(state["after_id"])
+                except Exception:
+                    pass
+            editor.destroy()
+
+        editor.protocol("WM_DELETE_WINDOW", close)
+        body = ctk.CTkFrame(editor, fg_color=PANEL, corner_radius=16)
+        body.pack(fill="both", expand=True, padx=18, pady=18)
+        self._label(body, "MONTAGE EXPRESS", 21, TEXT, "bold").pack(anchor="w", padx=22, pady=(18, 2))
+        self._label(body, path.name, 12, MUTED).pack(anchor="w", padx=22, pady=(0, 10))
+        preview_label = ctk.CTkLabel(body, text="Chargement de la vidéo…", width=620,
+                                     height=300, fg_color="#0C111D", corner_radius=10)
+        preview_label.pack(padx=16, pady=(0, 10))
+        info = self._label(body, "Analyse de la durée…", 12, MUTED)
+        info.pack(pady=(0, 8))
+        control = ctk.CTkFrame(body, fg_color="transparent")
+        control.pack(fill="x", padx=22)
+        self._label(control, "DÉBUT", 12, ACCENT, "bold").pack(anchor="w")
+        start_label = self._label(control, "00:00.0", 12, TEXT)
+        start_label.pack(anchor="e")
+        start_slider = ctk.CTkSlider(control, from_=0, to=1, number_of_steps=1000,
+                                     progress_color=ACCENT, button_color=ACCENT)
+        start_slider.pack(fill="x", pady=(0, 12))
+        self._label(control, "FIN", 12, ACCENT, "bold").pack(anchor="w")
+        end_label = self._label(control, "00:00.0", 12, TEXT)
+        end_label.pack(anchor="e")
+        end_slider = ctk.CTkSlider(control, from_=0, to=1, number_of_steps=1000,
+                                   progress_color=ACCENT, button_color=ACCENT)
+        end_slider.pack(fill="x", pady=(0, 10))
+        result_label = self._label(control, "", 12, MUTED)
+        result_label.pack(anchor="w", pady=(0, 10))
+
+        def timestamp(value):
+            return f"{int(value // 60):02d}:{value % 60:04.1f}"
+
+        def refresh_values():
+            start_label.configure(text=timestamp(state["start"]))
+            end_label.configure(text=timestamp(state["end"]))
+            result_label.configure(text=f"Extrait sélectionné : {max(0, state['end'] - state['start']):.1f} seconde(s)")
+
+        def render_preview(seconds):
+            if state["closed"]:
+                return
+            state["seq"] += 1
+            sequence = state["seq"]
+            def job():
+                try:
+                    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+                    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin",
+                           "-ss", f"{seconds:.3f}", "-i", str(path), "-frames:v", "1",
+                           "-vf", "scale=640:360:force_original_aspect_ratio=decrease",
+                           "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
+                    completed = subprocess.run(cmd, capture_output=True, timeout=25,
+                                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if completed.returncode != 0 or not completed.stdout:
+                        raise RuntimeError("Aucune image disponible à cette position")
+                    from io import BytesIO
+                    with Image.open(BytesIO(completed.stdout)) as im:
+                        frame = im.convert("RGB").copy()
+                    self.events.put(("editor_frame", (editor, state, sequence, frame, preview_label)))
+                except Exception as exc:
+                    self.events.put(("editor_frame_error", (editor, state, sequence, str(exc), preview_label)))
+            threading.Thread(target=job, daemon=True).start()
+
+        def request_preview(seconds):
+            if state["after_id"] is not None:
+                editor.after_cancel(state["after_id"])
+            state["after_id"] = editor.after(220, lambda: render_preview(seconds))
+
+        def adjust_start(value):
+            state["start"] = min(float(value), max(0, state["end"] - 0.1))
+            start_slider.set(state["start"])
+            refresh_values()
+            request_preview(state["start"])
+
+        def adjust_end(value):
+            state["end"] = max(float(value), min(state["duration"], state["start"] + 0.1))
+            end_slider.set(state["end"])
+            refresh_values()
+            request_preview(max(0, state["end"] - 0.1))
+
+        start_slider.configure(command=adjust_start, state="disabled")
+        end_slider.configure(command=adjust_end, state="disabled")
+        buttons = ctk.CTkFrame(body, fg_color="transparent")
+        buttons.pack(fill="x", padx=22, pady=(2, 15))
+        play_button = self._button(buttons, "▶ Ouvrir la vidéo", lambda: self.open_image(path), width=174)
+        play_button.pack(side="left", padx=(0, 10))
+        export_button = self._button(buttons, "Exporter l'extrait MP4", lambda: export(), primary=True, width=230)
+        export_button.pack(side="left")
+        export_button.configure(state="disabled")
+
+        def export():
+            if state["closed"] or self.busy:
+                return
+            begin, end = state["start"], state["end"]
+            if end - begin < 0.1:
+                messagebox.showwarning(APP_NAME, "Sélectionnez au moins 0,1 seconde.", parent=editor)
+                return
+            self.busy = True
+            export_button.configure(state="disabled")
+            info.configure(text="Encodage de l’extrait en cours…")
+            self._set_status("Export vidéo en cours…")
+            def job():
+                dest = None
+                try:
+                    dest = path.with_name(path.stem + "_extrait.mp4")
+                    index = 2
+                    while dest.exists():
+                        dest = path.with_name(f"{path.stem}_extrait_{index}.mp4")
+                        index += 1
+                    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+                    cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                           "-ss", f"{begin:.3f}", "-i", str(path), "-t", f"{end-begin:.3f}",
+                           "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264", "-preset", "veryfast",
+                           "-crf", "20", "-c:a", "aac", "-b:a", "192k", "-pix_fmt", "yuv420p",
+                           "-movflags", "+faststart", str(dest)]
+                    completed = subprocess.run(cmd, capture_output=True, text=True,
+                                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    if completed.returncode != 0 or not dest.is_file() or dest.stat().st_size == 0:
+                        if dest.exists():
+                            dest.unlink()
+                        raise RuntimeError((completed.stderr or "Export impossible")[-650:])
+                    self.events.put(("trim_done", dest))
+                except Exception as exc:
+                    self.events.put(("trim_error", f"Découpage impossible : {exc}"))
+                finally:
+                    self.events.put(("editor_export_finished", (editor, state, info, export_button)))
+            threading.Thread(target=job, daemon=True).start()
+
+        def analyze():
             try:
-                dest = path.with_name(path.stem + "_extrait.mp4")
-                index = 2
-                while dest.exists():
-                    dest = path.with_name(f"{path.stem}_extrait_{index}.mp4")
-                    index += 1
                 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-                cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                       "-ss", str(begin), "-i", str(path), "-t", str(end - begin),
-                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                       "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dest)]
-                completed = subprocess.run(cmd, capture_output=True, text=True,
-                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-                if completed.returncode != 0 or not dest.exists() or not dest.stat().st_size:
-                    if dest.exists():
-                        dest.unlink()
-                    raise RuntimeError((completed.stderr or "Export vidéo impossible")[-700:])
-                self.events.put(("trim_done", dest))
+                result = subprocess.run([ffmpeg, "-hide_banner", "-i", str(path)],
+                                        capture_output=True, text=True, timeout=20,
+                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                import re
+                match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", result.stderr)
+                if not match:
+                    raise RuntimeError("La durée de cette vidéo n'a pas pu être déterminée.")
+                h, m, sec = match.groups()
+                duration = 3600 * int(h) + 60 * int(m) + float(sec)
+                if duration <= 0:
+                    raise RuntimeError("Durée vidéo invalide.")
+                self.events.put(("editor_ready", (editor, state, duration, start_slider,
+                                                  end_slider, info, export_button, refresh_values,
+                                                  render_preview, adjust_start, adjust_end)))
             except Exception as exc:
-                self.events.put(("trim_error", f"Découpage impossible : {exc}"))
-        threading.Thread(target=job, daemon=True).start()
+                self.events.put(("editor_error", (editor, state, str(exc), info)))
+        threading.Thread(target=analyze, daemon=True).start()
 
     def capture_zone(self):
         """Zone interactive sur l'écran principal : source Pillow, pas de contournement DRM."""
