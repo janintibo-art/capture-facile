@@ -1,0 +1,31 @@
+name: Construire EXE Windows
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Installer les dependances
+        run: python -m pip install -r requirements.txt
+      - name: Creer CaptureFacile.exe
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name CaptureFacile --collect-data customtkinter main.py
+      - name: Publier artefact EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: CaptureFacile-Windows
+          path: dist/CaptureFacile.exe
+      - name: Publication GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: gh release create "${{ github.ref_name }}" dist/CaptureFacile.exe --title "Capture Facile ${{ github.ref_name }}" --notes "EXE Windows autonome : aucune installation Python requise." --verify-tag
