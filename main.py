@@ -11,7 +11,8 @@ import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, Canvas, Toplevel
+from PIL import ImageTk, ImageOps
 
 import customtkinter as ctk
 from PIL import Image, ImageGrab
@@ -252,6 +253,7 @@ class CaptureApp(ctk.CTk):
         controls = ctk.CTkFrame(hero, fg_color="transparent")
         controls.pack(fill="x", padx=24, pady=(14, 12))
         self._button(controls, "📷  Capture JPEG / PNG", self.capture, primary=True, width=210).pack(side="left", padx=(0, 10))
+        self._button(controls, "▣  Zone", self.capture_zone, width=100).pack(side="left", padx=(0, 10))
         self.video_button = ctk.CTkButton(controls, text="●  Démarrer la vidéo", command=self.toggle_video,
                                           width=215, height=38, fg_color="#B54560", hover_color="#96354D",
                                           text_color=TEXT, corner_radius=11, font=("Segoe UI", 13, "bold"))
@@ -304,7 +306,7 @@ class CaptureApp(ctk.CTk):
                           width=205, fg_color=CARD, button_color="#344661").pack(side="left")
         self._label(video_opts, "NVENC nécessite un FFmpeg compatible et un pilote NVIDIA à jour.",
                     11, MUTED).pack(side="left", padx=12)
-        self._label(hero, "DXGI C++ v6 : écran principal uniquement. Les contenus protégés peuvent rester noirs.",
+        self._label(hero, "Éditeur v8 : recadrage et fonds d’écran. La capture de zone utilise Pillow (écran principal). Les contenus protégés peuvent rester noirs.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
@@ -599,11 +601,175 @@ class CaptureApp(ctk.CTk):
             row.pack(pady=(7, 10))
             ctk.CTkButton(row, text="Ouvrir", command=lambda p=path: self.open_image(p), width=52, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="Renommer", command=lambda p=path: self.rename_image(p), width=76, height=28, fg_color="#33455E").pack(side="left", padx=2)
+            if path.suffix.lower() != ".mp4":
+                ctk.CTkButton(row, text="Éditer", command=lambda p=path: self.edit_image(p), width=48, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="×", command=lambda p=path: self.delete_image(p), width=27, height=28, fg_color="#6C3548", hover_color="#AA4058").pack(side="left", padx=2)
         for col in range(cols):
             self.gallery.grid_columnconfigure(col, weight=1)
         if len(self.current_images) > 180:
             self._label(self.gallery, "180 images affichées. Ouvrez le dossier pour voir les autres.", 11, MUTED).grid(row=(180 // cols) + 1, column=0, columnspan=cols, pady=12)
+
+    def capture_zone(self):
+        """Zone interactive sur l'écran principal : source Pillow, pas de contournement DRM."""
+        if self.busy or self.recording:
+            self._set_status("Terminez l'enregistrement ou la capture en cours.", True)
+            return
+        self.busy = True
+        self._set_status("Sélectionnez une zone à la souris (Échap pour annuler).")
+        self.withdraw()
+        self.after(320, self._show_zone_overlay)
+
+    def _show_zone_overlay(self):
+        try:
+            screenshot = ImageGrab.grab()
+            overlay = Toplevel(self)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            # Photo initiale affichée telle quelle, pour un cadrage précis.
+            overlay.geometry(f"{screenshot.width}x{screenshot.height}+0+0")
+            canvas = Canvas(overlay, width=screenshot.width, height=screenshot.height,
+                            highlightthickness=0, cursor="crosshair")
+            canvas.pack(fill="both", expand=True)
+            preview = ImageTk.PhotoImage(screenshot)
+            canvas.create_image(0, 0, image=preview, anchor="nw")
+            canvas.image_ref = preview
+            canvas.create_rectangle(0, 0, screenshot.width, 33, fill="#142035", outline="")
+            canvas.create_text(16, 16, anchor="w", fill="white",
+                               text="Glissez pour sélectionner • Échap pour annuler")
+            state = {"start": None, "rect": None, "done": False}
+
+            def cancel(_event=None):
+                if state["done"]:
+                    return
+                state["done"] = True
+                overlay.destroy()
+                self.deiconify()
+                self.busy = False
+                self._set_status("Sélection annulée")
+
+            def press(event):
+                state["start"] = (event.x, event.y)
+                if state["rect"]:
+                    canvas.delete(state["rect"])
+                state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                        outline="#29D3B0", width=3)
+            def drag(event):
+                if state["start"] and state["rect"]:
+                    x, y = state["start"]
+                    canvas.coords(state["rect"], x, y, event.x, event.y)
+            def release(event):
+                if not state["start"] or state["done"]:
+                    return
+                x, y = state["start"]
+                box = (max(0, min(x, event.x)), max(0, min(y, event.y)),
+                       min(screenshot.width, max(x, event.x)),
+                       min(screenshot.height, max(y, event.y)))
+                if box[2] - box[0] < 4 or box[3] - box[1] < 4:
+                    return
+                state["done"] = True
+                overlay.destroy()
+                self.deiconify()
+                self.busy = False
+                try:
+                    folder = Path(self.settings["folder"])
+                    folder.mkdir(parents=True, exist_ok=True)
+                    kind = self.settings["format"]
+                    output = folder / f"zone_{datetime.now():%Y-%m-%d_%H-%M-%S_%f}{FORMATS[kind]}"
+                    result = screenshot.crop(box)
+                    result.save(output, "JPEG" if kind == "JPEG" else "PNG",
+                                **({"quality": 94} if kind == "JPEG" else {}))
+                    self.refresh_gallery()
+                    self._set_status(f"✓ Zone enregistrée : {output.name}")
+                except Exception as exc:
+                    messagebox.showerror(APP_NAME, f"Enregistrement de la zone impossible : {exc}")
+            canvas.bind("<ButtonPress-1>", press)
+            canvas.bind("<B1-Motion>", drag)
+            canvas.bind("<ButtonRelease-1>", release)
+            overlay.bind("<Escape>", cancel)
+            overlay.focus_force()
+        except Exception as exc:
+            self.deiconify()
+            self.busy = False
+            messagebox.showerror(APP_NAME, f"Capture de zone impossible : {exc}")
+
+    def edit_image(self, path):
+        """Éditeur non destructif : zone libre et export en résolution fond d'écran."""
+        try:
+            with Image.open(path) as src:
+                source = ImageOps.exif_transpose(src).convert("RGB")
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"Image illisible : {exc}")
+            return
+        editor = ctk.CTkToplevel(self)
+        editor.title(f"Éditeur • {path.name}")
+        editor.geometry("970x760")
+        editor.minsize(630, 480)
+        editor.after(150, editor.lift)
+        frame = ctk.CTkFrame(editor, fg_color=PANEL)
+        frame.pack(fill="both", expand=True, padx=14, pady=14)
+        self._label(frame, "Glissez sur l’image pour choisir un recadrage (facultatif)", 14, TEXT, "bold").pack(pady=10)
+        scale = min(850 / source.width, 490 / source.height, 1.0)
+        pw, ph = max(1, int(source.width * scale)), max(1, int(source.height * scale))
+        preview = source.resize((pw, ph), Image.Resampling.LANCZOS)
+        canvas = Canvas(frame, width=pw, height=ph, bg="#121927", highlightthickness=0)
+        canvas.pack(pady=8)
+        ref = ImageTk.PhotoImage(preview)
+        canvas.image_ref = ref
+        canvas.create_image(0, 0, image=ref, anchor="nw")
+        state = {"origin": None, "rect": None, "box": None}
+
+        def start(event):
+            state["origin"] = (event.x, event.y)
+            state["box"] = None
+            if state["rect"]:
+                canvas.delete(state["rect"])
+            state["rect"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                    outline="#29D3B0", width=2)
+        def move(event):
+            if state["origin"]:
+                x, y = state["origin"]
+                canvas.coords(state["rect"], x, y, event.x, event.y)
+        def finish(event):
+            if state["origin"]:
+                x, y = state["origin"]
+                x1, y1, x2, y2 = max(0, min(x, event.x)), max(0, min(y, event.y)), min(pw, max(x, event.x)), min(ph, max(y, event.y))
+                if x2 - x1 >= 3 and y2 - y1 >= 3:
+                    state["box"] = tuple(int(v / scale) for v in (x1, y1, x2, y2))
+                state["origin"] = None
+        canvas.bind("<ButtonPress-1>", start)
+        canvas.bind("<B1-Motion>", move)
+        canvas.bind("<ButtonRelease-1>", finish)
+        options = ctk.CTkFrame(frame, fg_color="transparent")
+        options.pack(pady=13)
+        self._label(options, "EXPORT", 12, MUTED, "bold").pack(side="left", padx=8)
+        presets = {"Dimensions originales": None, "Full HD 1920 × 1080": (1920, 1080),
+                   "QHD 2560 × 1440": (2560, 1440), "4K 3840 × 2160": (3840, 2160)}
+        preset = ctk.StringVar(value="Dimensions originales")
+        ctk.CTkOptionMenu(options, variable=preset, values=list(presets), width=225).pack(side="left", padx=8)
+        output_format = ctk.StringVar(value="JPEG")
+        ctk.CTkOptionMenu(options, variable=output_format, values=["JPEG", "PNG"], width=95).pack(side="left", padx=8)
+
+        def export():
+            try:
+                result = source.crop(state["box"]) if state["box"] else source.copy()
+                dims = presets[preset.get()]
+                if dims:
+                    # LANCZOS + crop centré : aucune déformation de l'image.
+                    result = ImageOps.fit(result, dims, method=Image.Resampling.LANCZOS)
+                extension = FORMATS[output_format.get()]
+                destination = path.with_name(path.stem + "_edite" + extension)
+                counter = 2
+                while destination.exists():
+                    destination = path.with_name(path.stem + f"_edite_{counter}" + extension)
+                    counter += 1
+                result.save(destination, "JPEG" if extension == ".jpg" else "PNG",
+                            **({"quality": 95} if extension == ".jpg" else {}))
+                editor.destroy()
+                self.refresh_gallery()
+                self._set_status(f"✓ Image exportée : {destination.name}")
+            except Exception as exc:
+                messagebox.showerror(APP_NAME, f"Export impossible : {exc}", parent=editor)
+        self._button(frame, "Enregistrer une nouvelle image", export, primary=True, width=285).pack(pady=(2, 16))
 
     def open_image(self, path):
         try:
