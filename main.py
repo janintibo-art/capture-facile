@@ -1,5 +1,6 @@
 """Capture Facile — captures photo et vidéo pour Windows."""
 import json
+import re
 import ctypes
 import os
 import queue
@@ -23,6 +24,7 @@ CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile
 FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
 CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)", "Capture Native (C++ / GDI)", "Capture DirectX 11 (C++ / DXGI) [v6]"]
 VIDEO_ENCODERS = ["CPU (H.264)", "NVIDIA NVENC (GPU)"]
+AUDIO_MODES = ["Sans audio", "Microphone", "Son du PC", "PC + microphone"]
 CAPTURE_TARGETS = ["Tous les écrans", "Écran principal"]
 HOTKEYS = {"Impr. écran": "print_screen", **{f"F{i}": f"f{i}" for i in range(1, 13)}}
 BG, PANEL, CARD, ACCENT, TEXT, MUTED = "#101523", "#1A2234", "#232E43", "#29D3B0", "#F2F5FF", "#A1B0CA"
@@ -49,7 +51,7 @@ def default_download_dir():
 
 
 def load_settings():
-    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0], "video_encoder": VIDEO_ENCODERS[0], "video_fps": "60", "video_region": ""}
+    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0], "video_encoder": VIDEO_ENCODERS[0], "video_fps": "60", "video_region": "", "audio_mode": "Sans audio", "audio_mic": "", "audio_pc": ""}
     try:
         settings = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
@@ -62,6 +64,8 @@ def load_settings():
         defaults["image_hotkey"] = "F1"
     if defaults["video_hotkey"] not in HOTKEYS or defaults["image_hotkey"] == defaults["video_hotkey"]:
         defaults["video_hotkey"] = "F2" if defaults["image_hotkey"] != "F2" else "F3"
+    if defaults["audio_mode"] not in AUDIO_MODES:
+        defaults["audio_mode"] = "Sans audio"
     if defaults["format"] not in FORMATS:
         defaults["format"] = "JPEG"
     if defaults["capture_engine"] not in CAPTURE_ENGINES:
@@ -202,6 +206,35 @@ def grab_with_engine(engine, target):
     raise RuntimeError(f"Moteur inconnu : {engine}")
 
 
+def list_dshow_audio_devices():
+    """Return actual Windows DirectShow audio capture device names reported by FFmpeg.
+
+    A loopback/What-U-Hear/Stereo Mix device must already be installed/enabled
+    to record PC audio; this function never disables audio content protection.
+    """
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    args = [ffmpeg, "-hide_banner", "-list_devices", "true", "-f", "dshow", "-i", "dummy"]
+    result = subprocess.run(args, capture_output=True, text=True, timeout=15,
+                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    devices = []
+    audio_section = False
+    for line in (result.stderr or "").splitlines():
+        if "DirectShow audio devices" in line:
+            audio_section = True
+            continue
+        if "DirectShow video devices" in line:
+            audio_section = False
+            continue
+        if not audio_section or "Alternative name" in line:
+            continue
+        match = re.search(r'"([^"\r\n]+)"', line)
+        if match:
+            devices.append(match.group(1))
+    return list(dict.fromkeys(devices))
+
+
+
+
 class CaptureApp(ctk.CTk):
     def __init__(self):
         super().__init__()
@@ -314,7 +347,33 @@ class CaptureApp(ctk.CTk):
                           width=82, fg_color=CARD, button_color="#344661").pack(side="left", padx=(0, 10))
         self._button(video_opts, "Zone vidéo", self.select_video_region, width=105).pack(side="left", padx=4)
         self._button(video_opts, "Écran entier", self.reset_video_region, width=105).pack(side="left", padx=4)
-        self._label(hero, "Vidéo v9 : 60 FPS conseillé. Zone optionnelle sur l'écran principal, encodage MP4 sans audio.",
+        audio_opts = ctk.CTkFrame(hero, fg_color="transparent")
+        audio_opts.pack(fill="x", padx=24, pady=(0, 10))
+        self._label(audio_opts, "SON VIDÉO", 11, MUTED, "bold").pack(side="left", padx=(0, 9))
+        self.audio_mode_var = ctk.StringVar(value=self.settings["audio_mode"])
+        ctk.CTkOptionMenu(audio_opts, values=AUDIO_MODES, variable=self.audio_mode_var,
+                          command=lambda value: self.change_capture_setting("audio_mode", value),
+                          width=155, fg_color=CARD, button_color="#344661").pack(side="left", padx=(0, 8))
+        self._button(audio_opts, "Détecter les appareils", self.detect_audio, width=165).pack(side="left", padx=4)
+        self._label(audio_opts, "Micro / Stereo Mix : sélectionnez les appareils ci-dessous", 11, MUTED).pack(side="left", padx=8)
+        device_opts = ctk.CTkFrame(hero, fg_color="transparent")
+        device_opts.pack(fill="x", padx=24, pady=(0, 11))
+        self._label(device_opts, "MICRO", 11, MUTED, "bold").pack(side="left", padx=(0, 7))
+        self.mic_var = ctk.StringVar(value=self.settings["audio_mic"] or "Non sélectionné")
+        self.mic_menu = ctk.CTkOptionMenu(device_opts, values=["Non sélectionné"], variable=self.mic_var,
+                            command=lambda value: self.select_audio_device("audio_mic", value), width=230,
+                            fg_color=CARD, button_color="#344661")
+        self.mic_menu.pack(side="left", padx=(0, 15))
+        self._label(device_opts, "SON PC", 11, MUTED, "bold").pack(side="left", padx=(0, 7))
+        self.pc_var = ctk.StringVar(value=self.settings["audio_pc"] or "Non sélectionné")
+        self.pc_menu = ctk.CTkOptionMenu(device_opts, values=["Non sélectionné"], variable=self.pc_var,
+                            command=lambda value: self.select_audio_device("audio_pc", value), width=230,
+                            fg_color=CARD, button_color="#344661")
+        self.pc_menu.pack(side="left")
+        self._label(hero, "Audio v10 : les entrées DirectShow doivent être visibles dans Windows. Pour le son PC, Stereo Mix ou équivalent est nécessaire.",
+                    11, MUTED).pack(anchor="w", padx=24, pady=(0, 7))
+        self.after(400, self.detect_audio)
+        self._label(hero, "Vidéo : 60 FPS conseillé. Capture de zone et MP4 audio AAC si un appareil est configuré.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 7))
         self._label(hero, "Éditeur v8 : recadrage et fonds d’écran. La capture de zone utilise Pillow (écran principal). Les contenus protégés peuvent rester noirs.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
@@ -335,7 +394,7 @@ class CaptureApp(ctk.CTk):
         bottom.pack(fill="x", padx=30, pady=(0, 14))
         self.status = self._label(bottom, "Prêt à capturer", 12, ACCENT)
         self.status.pack(side="left")
-        self._label(bottom, "MP4 vidéo sans audio • raccourcis globaux", 11, MUTED).pack(side="right")
+        self._label(bottom, "MP4 H.264 + AAC selon appareils • touches F1/F2", 11, MUTED).pack(side="right")
 
     def _short_path(self):
         p = self.settings["folder"]
@@ -434,6 +493,33 @@ class CaptureApp(ctk.CTk):
         else:
             self.start_video()
 
+    def select_audio_device(self, key, value):
+        self.settings[key] = "" if value == "Non sélectionné" else value
+        self._save_settings()
+        self._set_status(f"Appareil audio sélectionné : {value}")
+
+    def detect_audio(self):
+        if self.recording or self.finalizing_video:
+            return
+        try:
+            devices = list_dshow_audio_devices()
+            values = ["Non sélectionné", *devices]
+            self.mic_menu.configure(values=values)
+            self.pc_menu.configure(values=values)
+            for key, variable in (("audio_mic", self.mic_var), ("audio_pc", self.pc_var)):
+                previous = self.settings[key]
+                if previous not in devices:
+                    previous = ""
+                    self.settings[key] = ""
+                variable.set(previous or "Non sélectionné")
+            self._save_settings()
+            if devices:
+                self._set_status(f"{len(devices)} appareil(s) audio détecté(s). Choisissez votre micro et votre entrée Stereo Mix.")
+            else:
+                self._set_status("Aucune entrée audio DirectShow trouvée. Le mode sans audio reste disponible.", True)
+        except Exception as exc:
+            self._set_status(f"Détection audio indisponible : {exc}", True)
+
     def start_video(self):
         if self.finalizing_video or self.recording:
             return
@@ -466,11 +552,32 @@ class CaptureApp(ctk.CTk):
                     raise RuntimeError("La zone vidéo doit mesurer au moins 16 × 16 pixels.")
                 capture_args = ["-offset_x", str(left), "-offset_y", str(top),
                                 "-video_size", f"{width}x{height}"]
+            mode = self.settings.get("audio_mode", "Sans audio")
+            names = []
+            if mode in ("Son du PC", "PC + microphone"):
+                names.append(self.settings.get("audio_pc", ""))
+            if mode in ("Microphone", "PC + microphone"):
+                names.append(self.settings.get("audio_mic", ""))
+            if any(not name for name in names):
+                raise RuntimeError("Choisissez les appareils audio nécessaires dans les listes (bouton Détecter les appareils).")
+            if len(set(names)) != len(names):
+                raise RuntimeError("Choisissez deux appareils différents pour enregistrer PC + microphone.")
             command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                       "-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1",
-                       *capture_args, "-i", "desktop",
-                       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                       *codec_options, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
+                       "-thread_queue_size", "1024", "-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1",
+                       *capture_args, "-i", "desktop"]
+            for name in names:
+                command.extend(["-thread_queue_size", "1024", "-f", "dshow", "-i", f"audio={name}"])
+            command.extend(["-map", "0:v:0"])
+            if len(names) == 2:
+                command.extend(["-filter_complex", "[1:a:0][2:a:0]amix=inputs=2:duration=longest:dropout_transition=0:normalize=0[aout]",
+                                "-map", "[aout]"])
+            elif len(names) == 1:
+                command.extend(["-map", "1:a:0"])
+            command.extend(["-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2", *codec_options,
+                            "-pix_fmt", "yuv420p"])
+            if names:
+                command.extend(["-c:a", "aac", "-b:a", "192k", "-ar", "48000"])
+            command.extend(["-movflags", "+faststart", str(output)])
             log_path = CONFIG_FILE.parent / "ffmpeg-last.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = log_path.open("wb")
