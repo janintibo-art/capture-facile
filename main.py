@@ -3,6 +3,8 @@ import json
 import os
 import queue
 import subprocess
+import time
+import imageio_ffmpeg
 import sys
 import threading
 import uuid
@@ -17,7 +19,7 @@ from pynput import keyboard
 APP_NAME = "Capture Facile"
 CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile" / "settings.json"
 FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
-HOTKEYS = {"Impr. écran": "print_screen", "F8": "f8", "F9": "f9", "F10": "f10"}
+HOTKEYS = {"Impr. écran": "print_screen", **{f"F{i}": f"f{i}" for i in range(1, 13)}}
 BG, PANEL, CARD, ACCENT, TEXT, MUTED = "#101523", "#1A2234", "#232E43", "#29D3B0", "#F2F5FF", "#A1B0CA"
 
 
@@ -42,17 +44,21 @@ def default_download_dir():
 
 
 def load_settings():
-    defaults = {"folder": str(default_download_dir()), "hotkey": "Impr. écran", "format": "PNG"}
+    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG"}
     try:
         settings = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
-            defaults.update({k: v for k, v in settings.items() if k in defaults and isinstance(v, str)})
+            for key in defaults:
+                if key in settings and isinstance(settings[key], str):
+                    defaults[key] = settings[key]
     except (OSError, ValueError):
         pass
-    if defaults["hotkey"] not in HOTKEYS:
-        defaults["hotkey"] = "Impr. écran"
+    if defaults["image_hotkey"] not in HOTKEYS:
+        defaults["image_hotkey"] = "F1"
+    if defaults["video_hotkey"] not in HOTKEYS or defaults["image_hotkey"] == defaults["video_hotkey"]:
+        defaults["video_hotkey"] = "F2" if defaults["image_hotkey"] != "F2" else "F3"
     if defaults["format"] not in FORMATS:
-        defaults["format"] = "PNG"
+        defaults["format"] = "JPEG"
     return defaults
 
 
@@ -67,6 +73,12 @@ class CaptureApp(ctk.CTk):
         self.settings = load_settings()
         self.events = queue.Queue()
         self.busy = False
+        self.recording = False
+        self.finalizing_video = False
+        self.video_process = None
+        self.video_path = None
+        self.video_log = None
+        self.video_log_path = None
         self.current_images = []
         self.selected = None
         self.thumb_refs = []
@@ -92,41 +104,51 @@ class CaptureApp(ctk.CTk):
 
     def _build_ui(self):
         header = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        header.pack(fill="x", padx=28, pady=(23, 10))
+        header.pack(fill="x", padx=28, pady=(20, 8))
         self._label(header, "◉  CAPTURE FACILE", 25, TEXT, "bold").pack(side="left")
-        self._label(header, "CAPTURE  •  CLASSEMENT  •  LIBERTÉ", 11, MUTED).pack(side="right", pady=11)
+        self._label(header, "PHOTO  •  VIDÉO  •  BIBLIOTHÈQUE", 11, MUTED).pack(side="right", pady=11)
 
         hero = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=20)
-        hero.pack(fill="x", padx=28, pady=(5, 16))
-        top = ctk.CTkFrame(hero, fg_color="transparent")
-        top.pack(fill="x", padx=24, pady=(20, 12))
-        left = ctk.CTkFrame(top, fg_color="transparent")
-        left.pack(side="left", fill="x", expand=True)
-        self._label(left, "Une touche. Une capture. C'est enregistré.", 19, TEXT, "bold").pack(anchor="w")
-        self._label(left, "L'application reste ouverte pendant vos jeux ou logiciels.", 12, MUTED).pack(anchor="w", pady=(5, 0))
-        self._button(top, "●  Capturer maintenant", self.capture, primary=True, width=220).pack(side="right", padx=(10, 0))
+        hero.pack(fill="x", padx=28, pady=(5, 14))
+        self._label(hero, "Une touche pour la photo. Une touche pour la vidéo.", 18, TEXT, "bold").pack(anchor="w", padx=24, pady=(17, 2))
+        self._label(hero, "Appuyez de nouveau sur la touche vidéo pour terminer le MP4.", 12, MUTED).pack(anchor="w", padx=24)
+        controls = ctk.CTkFrame(hero, fg_color="transparent")
+        controls.pack(fill="x", padx=24, pady=(14, 12))
+        self._button(controls, "📷  Capture JPEG / PNG", self.capture, primary=True, width=210).pack(side="left", padx=(0, 10))
+        self.video_button = ctk.CTkButton(controls, text="●  Démarrer la vidéo", command=self.toggle_video,
+                                          width=215, height=38, fg_color="#B54560", hover_color="#96354D",
+                                          text_color=TEXT, corner_radius=11, font=("Segoe UI", 13, "bold"))
+        self.video_button.pack(side="left")
+        self.record_label = self._label(controls, "●  Aucune vidéo en cours", 12, MUTED)
+        self.record_label.pack(side="left", padx=16)
+
         opts = ctk.CTkFrame(hero, fg_color="transparent")
-        opts.pack(fill="x", padx=24, pady=(3, 20))
-        self._label(opts, "TOUCHE", 11, MUTED, "bold").grid(row=0, column=0, sticky="w", padx=(0, 14))
-        self.hotkey_var = ctk.StringVar(value=self.settings["hotkey"])
-        self.hotkey_menu = ctk.CTkOptionMenu(opts, values=list(HOTKEYS), variable=self.hotkey_var, command=self.change_hotkey,
-                                              width=150, fg_color=CARD, button_color="#344661", button_hover_color="#425779")
-        self.hotkey_menu.grid(row=1, column=0, sticky="w", padx=(0, 14), pady=(4, 0))
-        self._label(opts, "FORMAT", 11, MUTED, "bold").grid(row=0, column=1, sticky="w", padx=(0, 14))
+        opts.pack(fill="x", padx=24, pady=(0, 18))
+        self._label(opts, "TOUCHE PHOTO", 11, MUTED, "bold").grid(row=0, column=0, sticky="w", padx=(0, 12))
+        self.image_hotkey_var = ctk.StringVar(value=self.settings["image_hotkey"])
+        ctk.CTkOptionMenu(opts, values=list(HOTKEYS), variable=self.image_hotkey_var,
+                          command=lambda value: self.change_hotkey("image_hotkey", value),
+                          width=115, fg_color=CARD, button_color="#344661").grid(row=1, column=0, sticky="w", padx=(0, 12), pady=(4, 0))
+        self._label(opts, "TOUCHE VIDÉO", 11, MUTED, "bold").grid(row=0, column=1, sticky="w", padx=(0, 12))
+        self.video_hotkey_var = ctk.StringVar(value=self.settings["video_hotkey"])
+        ctk.CTkOptionMenu(opts, values=list(HOTKEYS), variable=self.video_hotkey_var,
+                          command=lambda value: self.change_hotkey("video_hotkey", value),
+                          width=115, fg_color=CARD, button_color="#344661").grid(row=1, column=1, sticky="w", padx=(0, 12), pady=(4, 0))
+        self._label(opts, "FORMAT PHOTO", 11, MUTED, "bold").grid(row=0, column=2, sticky="w", padx=(0, 12))
         self.format_var = ctk.StringVar(value=self.settings["format"])
         ctk.CTkOptionMenu(opts, values=list(FORMATS), variable=self.format_var, command=self.change_format,
-                          width=108, fg_color=CARD, button_color="#344661", button_hover_color="#425779").grid(row=1, column=1, sticky="w", padx=(0, 22), pady=(4, 0))
-        self._label(opts, "DOSSIER DE DESTINATION", 11, MUTED, "bold").grid(row=0, column=2, sticky="w")
+                          width=100, fg_color=CARD, button_color="#344661").grid(row=1, column=2, sticky="w", padx=(0, 15), pady=(4, 0))
+        self._label(opts, "DOSSIER DE DESTINATION", 11, MUTED, "bold").grid(row=0, column=3, sticky="w")
         folder_row = ctk.CTkFrame(opts, fg_color="transparent")
-        folder_row.grid(row=1, column=2, sticky="ew", pady=(4, 0))
+        folder_row.grid(row=1, column=3, sticky="ew", pady=(4, 0))
         self.folder_label = self._label(folder_row, self._short_path(), 12, TEXT)
-        self.folder_label.pack(side="left", padx=(0, 10))
-        self._button(folder_row, "Modifier", self.choose_folder, width=95).pack(side="left")
-        opts.grid_columnconfigure(2, weight=1)
+        self.folder_label.pack(side="left", padx=(0, 8))
+        self._button(folder_row, "Modifier", self.choose_folder, width=85).pack(side="left")
+        opts.grid_columnconfigure(3, weight=1)
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(fill="x", padx=30, pady=(0, 9))
-        self._label(actions, "BIBLIOTHÈQUE D'IMAGES", 17, TEXT, "bold").pack(side="left")
+        self._label(actions, "BIBLIOTHÈQUE PHOTO & VIDÉO", 17, TEXT, "bold").pack(side="left")
         self.count_label = self._label(actions, "", 12, MUTED)
         self.count_label.pack(side="left", padx=13)
         self._button(actions, "Ouvrir le dossier", self.open_folder, width=156).pack(side="right", padx=(8, 0))
@@ -140,7 +162,7 @@ class CaptureApp(ctk.CTk):
         bottom.pack(fill="x", padx=30, pady=(0, 14))
         self.status = self._label(bottom, "Prêt à capturer", 12, ACCENT)
         self.status.pack(side="left")
-        self._label(bottom, "Raccourci global actif tant que l'application est lancée", 11, MUTED).pack(side="right")
+        self._label(bottom, "MP4 vidéo sans audio • raccourcis globaux", 11, MUTED).pack(side="right")
 
     def _short_path(self):
         p = self.settings["folder"]
@@ -157,14 +179,15 @@ class CaptureApp(ctk.CTk):
         self.listener.start()
 
     def _on_key(self, key):
-        hotkey = HOTKEYS[self.settings["hotkey"]]
-        try:
-            if hotkey == "print_screen" and key == keyboard.Key.print_screen:
-                self.events.put(("capture", None))
-            elif hotkey != "print_screen" and key == getattr(keyboard.Key, hotkey):
-                self.events.put(("capture", None))
-        except (AttributeError, ValueError):
-            pass
+        # on_release avoids Windows auto-repeat toggling recording multiple times.
+        for action, setting in (("capture", "image_hotkey"), ("video_toggle", "video_hotkey")):
+            try:
+                key_name = HOTKEYS[self.settings[setting]]
+                if key == getattr(keyboard.Key, key_name):
+                    self.events.put((action, None))
+                    return
+            except (AttributeError, ValueError):
+                continue
 
     def _poll(self):
         while True:
@@ -174,6 +197,17 @@ class CaptureApp(ctk.CTk):
                 break
             if action == "capture":
                 self.capture()
+            elif action == "video_toggle":
+                self.toggle_video()
+            elif action == "video_stopped":
+                self._set_status(f"✓ Vidéo enregistrée : {payload.name}")
+                self.refresh_gallery()
+            elif action == "record_idle":
+                self.finalizing_video = False
+                self.record_label.configure(text="●  Aucune vidéo en cours", text_color=MUTED)
+            elif action == "video_error":
+                self._set_status(str(payload), True)
+                messagebox.showerror(APP_NAME, str(payload))
             elif action == "saved":
                 self.busy = False
                 self._set_status(f"✓ Capture enregistrée : {payload.name}")
@@ -210,10 +244,110 @@ class CaptureApp(ctk.CTk):
                 self.events.put(("error", f"Capture impossible : {exc}"))
         threading.Thread(target=job, daemon=True).start()
 
-    def change_hotkey(self, value):
-        self.settings["hotkey"] = value
+    def toggle_video(self):
+        if self.recording:
+            self.stop_video()
+        else:
+            self.start_video()
+
+    def start_video(self):
+        if self.finalizing_video or self.recording:
+            return
+        try:
+            folder = Path(self.settings["folder"])
+            folder.mkdir(parents=True, exist_ok=True)
+            output = folder / f"video_{datetime.now():%Y-%m-%d_%H-%M-%S_%f}.mp4"
+            ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+            # gdigrab captures the Windows desktop. Even resolutions are required by yuv420p.
+            command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
+                       "-f", "gdigrab", "-framerate", "20", "-draw_mouse", "1", "-i", "desktop",
+                       "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+                       "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                       "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
+            log_path = CONFIG_FILE.parent / "ffmpeg-last.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_file = log_path.open("wb")
+            try:
+                proc = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                                        stderr=log_file, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception:
+                log_file.close()
+                raise
+            self.video_process = proc
+            self.video_path = output
+            self.video_log = log_file
+            self.video_log_path = log_path
+            self.recording = True
+            self.record_started = time.monotonic()
+            self.video_button.configure(text="■  Arrêter la vidéo", fg_color="#C73F50")
+            self.record_label.configure(text="● REC  00:00", text_color="#FF7182")
+            self._set_status("Enregistrement vidéo en cours…")
+            self._update_recording_clock()
+        except Exception as exc:
+            self.events.put(("video_error", f"Démarrage vidéo impossible : {exc}"))
+
+    def _update_recording_clock(self):
+        if not self.recording:
+            return
+        seconds = int(time.monotonic() - self.record_started)
+        self.record_label.configure(text=f"● REC  {seconds // 60:02d}:{seconds % 60:02d}")
+        if self.video_process and self.video_process.poll() is not None:
+            self.stop_video()
+        else:
+            self.after(500, self._update_recording_clock)
+
+    def stop_video(self):
+        if not self.recording:
+            return
+        self.recording = False
+        self.finalizing_video = True
+        self.video_button.configure(text="●  Démarrer la vidéo", fg_color="#B54560")
+        self.record_label.configure(text="●  Finalisation MP4…", text_color=MUTED)
+        proc = self.video_process
+        output = self.video_path
+        log_file = self.video_log
+        log_path = self.video_log_path
+        self.video_process = None
+        self.video_log = None
+        self._set_status("Finalisation de la vidéo…")
+
+        def finalize():
+            try:
+                if proc.poll() is None:
+                    try:
+                        proc.stdin.write(b"q\n")
+                        proc.stdin.flush()
+                    except (OSError, ValueError):
+                        pass
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                if log_file:
+                    log_file.close()
+                if proc.returncode != 0 or not output.exists() or output.stat().st_size == 0:
+                    details = log_path.read_text(encoding="utf-8", errors="replace")[-700:] if log_path.exists() else ""
+                    raise RuntimeError(details or f"FFmpeg code {proc.returncode}")
+                self.events.put(("video_stopped", output))
+            except Exception as exc:
+                if log_file and not log_file.closed:
+                    log_file.close()
+                self.events.put(("video_error", f"Enregistrement vidéo échoué : {exc}"))
+            finally:
+                self.events.put(("record_idle", None))
+        threading.Thread(target=finalize, daemon=True).start()
+
+    def change_hotkey(self, setting, value):
+        other = "video_hotkey" if setting == "image_hotkey" else "image_hotkey"
+        if value == self.settings[other]:
+            # Swap assignments rather than allowing two actions on the same key.
+            self.settings[other] = self.settings[setting]
+        self.settings[setting] = value
+        self.image_hotkey_var.set(self.settings["image_hotkey"])
+        self.video_hotkey_var.set(self.settings["video_hotkey"])
         self._save_settings()
-        self._set_status(f"Raccourci modifié : {value}")
+        self._set_status("Touches mises à jour")
 
     def change_format(self, value):
         self.settings["format"] = value
@@ -248,11 +382,11 @@ class CaptureApp(ctk.CTk):
     def refresh_gallery(self):
         folder = Path(self.settings["folder"])
         try:
-            self.current_images = sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg")),
+            self.current_images = sorted((p for p in folder.iterdir() if p.is_file() and p.suffix.lower() in (".png", ".jpg", ".jpeg", ".mp4")),
                                          key=lambda p: p.stat().st_mtime, reverse=True)
         except OSError:
             self.current_images = []
-        self.count_label.configure(text=f"{len(self.current_images)} image(s)")
+        self.count_label.configure(text=f"{len(self.current_images)} fichier(s)")
         self._layout_gallery()
 
     def _layout_gallery(self):
@@ -270,20 +404,23 @@ class CaptureApp(ctk.CTk):
             tile = ctk.CTkFrame(self.gallery, fg_color=CARD, corner_radius=13)
             tile.grid(row=index // cols, column=index % cols, padx=8, pady=9, sticky="nsew")
             try:
-                with Image.open(path) as source:
-                    image = source.copy()
-                image.thumbnail((185, 115))
-                ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
-                self.thumb_refs.append(ctk_image)
-                thumbnail = ctk.CTkLabel(tile, image=ctk_image, text="", width=185, height=118)
-                thumbnail.pack(padx=8, pady=(10, 5))
-                thumbnail.bind("<Button-1>", lambda _event, p=path: self.open_image(p))
+                if path.suffix.lower() == ".mp4":
+                    self._label(tile, "▶  VIDÉO MP4", 19, ACCENT, "bold").pack(padx=8, pady=(52, 46))
+                else:
+                    with Image.open(path) as source:
+                        image = source.copy()
+                    image.thumbnail((185, 115))
+                    ctk_image = ctk.CTkImage(light_image=image, dark_image=image, size=image.size)
+                    self.thumb_refs.append(ctk_image)
+                    thumbnail = ctk.CTkLabel(tile, image=ctk_image, text="", width=185, height=118)
+                    thumbnail.pack(padx=8, pady=(10, 5))
+                    thumbnail.bind("<Button-1>", lambda _event, p=path: self.open_image(p))
             except Exception:
                 self._label(tile, "Image illisible", 12, MUTED).pack(pady=40)
             self._label(tile, path.name[:25] + ("…" if len(path.name) > 25 else ""), 11, TEXT).pack(padx=6)
             row = ctk.CTkFrame(tile, fg_color="transparent")
             row.pack(pady=(7, 10))
-            ctk.CTkButton(row, text="Voir", command=lambda p=path: self.open_image(p), width=52, height=28, fg_color="#33455E").pack(side="left", padx=2)
+            ctk.CTkButton(row, text="Ouvrir", command=lambda p=path: self.open_image(p), width=52, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="Renommer", command=lambda p=path: self.rename_image(p), width=76, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="×", command=lambda p=path: self.delete_image(p), width=27, height=28, fg_color="#6C3548", hover_color="#AA4058").pack(side="left", padx=2)
         for col in range(cols):
@@ -323,11 +460,14 @@ class CaptureApp(ctk.CTk):
         try:
             path.unlink()
             self.refresh_gallery()
-            self._set_status(f"Image supprimée : {path.name}")
+            self._set_status(f"Fichier supprimé : {path.name}")
         except OSError as exc:
             messagebox.showerror(APP_NAME, f"Suppression impossible : {exc}")
 
     def _close(self):
+        if self.recording or self.finalizing_video:
+            messagebox.showwarning(APP_NAME, "Arrêtez la vidéo et attendez la finalisation avant de fermer l’application.")
+            return
         if self.listener:
             self.listener.stop()
         self.destroy()
