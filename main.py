@@ -1,4 +1,4 @@
-"""Capture Facile — captures d'écran simples sous Windows."""
+"""Capture Facile — captures photo et vidéo pour Windows."""
 import json
 import ctypes
 import os
@@ -20,7 +20,7 @@ from pynput import keyboard
 APP_NAME = "Capture Facile"
 CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile" / "settings.json"
 FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
-CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)", "Capture Native (C++ / GDI)"]
+CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)", "Capture Native (C++ / GDI)", "Capture DirectX 11 (C++ / DXGI) [v6]"]
 VIDEO_ENCODERS = ["CPU (H.264)", "NVIDIA NVENC (GPU)"]
 CAPTURE_TARGETS = ["Tous les écrans", "Écran principal"]
 HOTKEYS = {"Impr. écran": "print_screen", **{f"F{i}": f"f{i}" for i in range(1, 13)}}
@@ -105,6 +105,59 @@ def native_capture(target):
     return Image.frombytes("RGB", (width, height), buf.raw, "raw", "BGRX")
 
 
+
+def native_dxgi_capture(target):
+    """Independent D3D11/DXGI photo capture engine; primary display only."""
+    if target != "Écran principal":
+        raise RuntimeError("Le moteur DirectX C++ v6 prend en charge l'écran principal uniquement. Sélectionnez 'Écran principal'.")
+    if sys.platform != "win32":
+        raise RuntimeError("Ce moteur DirectX 11 nécessite Windows.")
+    dll_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "capture_dxgi.dll"
+    if not dll_path.is_file():
+        raise RuntimeError("capture_dxgi.dll introuvable dans l'EXE.")
+    dll = ctypes.WinDLL(str(dll_path))
+    fn = dll.CaptureDXGIPrimaryBGRA
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int)]
+    fn.restype = ctypes.c_int
+    width = ctypes.c_int(0)
+    height = ctypes.c_int(0)
+    # First call obtains actual dimensions; buffer is deliberately absent.
+    result = fn(None, 0, ctypes.byref(width), ctypes.byref(height))
+    messages = {
+        1: "Arguments invalides", 2: "Initialisation DXGI impossible",
+        3: "Écran principal introuvable", 4: "Périphérique Direct3D indisponible",
+        5: "Duplication non autorisée (session ou pilote)",
+        6: "Aucune nouvelle image disponible", 7: "Échec de récupération de l'image",
+        8: "Tampon trop petit", 9: "Allocation mémoire graphique impossible",
+        10: "Lecture de texture impossible", 11: "Format ou orientation d'écran non pris en charge"
+    }
+    if result != 8 or width.value < 1 or height.value < 1:
+        raise RuntimeError(f"DirectX 11 : {messages.get(result, 'Erreur')} (code {result}).")
+    pixels = width.value * height.value
+    if pixels > 100_000_000:
+        raise RuntimeError("Résolution de capture trop élevée.")
+    buffer = ctypes.create_string_buffer(pixels * 4)
+    # Retry one time if the desktop frame changed / timed out.
+    for attempt in range(2):
+        width2, height2 = ctypes.c_int(), ctypes.c_int()
+        result = fn(buffer, len(buffer), ctypes.byref(width2), ctypes.byref(height2))
+        if result == 6 and attempt == 0:
+            continue
+        if result != 0:
+            raise RuntimeError(f"DirectX 11 : {messages.get(result, 'Erreur')} (code {result}).")
+        if (width2.value, height2.value) != (width.value, height.value):
+            raise RuntimeError("Résolution modifiée pendant la capture : réessayez.")
+        return Image.frombytes("RGB", (width.value, height.value), buffer.raw, "raw", "BGRX")
+    raise RuntimeError("DirectX 11 : délai de capture dépassé.")
+
+
+def suspected_black_frame(image):
+    """Heuristic only; dark scenes are allowed and should still be saved."""
+    sample = image.convert("RGB")
+    sample.thumbnail((96, 54))
+    lo, hi = sample.getextrema()[0], sample.getextrema()[1], sample.getextrema()[2]
+    return max(hi[1], lo[1], sample.getextrema()[2][1]) < 9
+
 def grab_with_engine(engine, target):
     """Capture ordinary desktop pixels; protected surfaces remain protected."""
     all_screens = target == "Tous les écrans"
@@ -141,6 +194,8 @@ def grab_with_engine(engine, target):
                 camera.release()
     if engine == CAPTURE_ENGINES[3]:
         return native_capture(target)
+    if engine == CAPTURE_ENGINES[4]:
+        return native_dxgi_capture(target)
     raise RuntimeError(f"Moteur inconnu : {engine}")
 
 
@@ -249,7 +304,7 @@ class CaptureApp(ctk.CTk):
                           width=205, fg_color=CARD, button_color="#344661").pack(side="left")
         self._label(video_opts, "NVENC nécessite un FFmpeg compatible et un pilote NVIDIA à jour.",
                     11, MUTED).pack(side="left", padx=12)
-        self._label(hero, "Modes réservés aux fenêtres capturables : les contenus protégés peuvent rester noirs.",
+        self._label(hero, "DXGI C++ v6 : écran principal uniquement. Les contenus protégés peuvent rester noirs.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
 
         actions = ctk.CTkFrame(self, fg_color="transparent")
@@ -316,7 +371,8 @@ class CaptureApp(ctk.CTk):
                 messagebox.showerror(APP_NAME, str(payload))
             elif action == "saved":
                 self.busy = False
-                self._set_status(f"✓ Capture enregistrée : {payload.name}")
+                saved_path, black = payload
+                self._set_status((f"⚠ Image très sombre : {saved_path.name} (vérifiez la protection vidéo)" if black else f"✓ Capture enregistrée : {saved_path.name}"))
                 self.refresh_gallery()
             elif action == "error":
                 self.busy = False
@@ -347,7 +403,7 @@ class CaptureApp(ctk.CTk):
                     screenshot.save(output, "JPEG", quality=94)
                 else:
                     screenshot.save(output, "PNG")
-                self.events.put(("saved", output))
+                self.events.put(("saved", (output, suspected_black_frame(screenshot))))
             except Exception as exc:
                 self.events.put(("error", f"Capture impossible : {exc}"))
         threading.Thread(target=job, daemon=True).start()

@@ -42,3 +42,25 @@ Application Windows 10/11 pour les captures photo et vidéo d’écran, interfac
 - NVENC est expérimental : l'FFmpeg fourni par imageio-ffmpeg peut ne pas contenir ce codec. Dans ce cas un message vous invite à choisir CPU ; le moteur vidéo reste `gdigrab`.
 - Les flux protégés (DRM) ne seront pas récupérés par le moteur natif.
 - **Vérification effectuée :** syntaxe Python et structure YAML, pas de compilation Windows locale.
+
+## v6 — Moteur DirectX 11 C++ original (expérimental)
+
+- Nouveau mode photo « Capture DirectX 11 (C++ / DXGI) [v6] ».
+- Code C++ autonome dans `native/capture_dxgi.cpp` utilisant Direct3D 11 et Desktop Duplication.
+- Lecture de la texture GPU dans une texture `D3D11_USAGE_STAGING` et conversion BGRA vers JPEG/PNG côté Python.
+- Limitation v6 : **écran principal**, orientation standard (pas d'écran pivoté) ; sélectionner « Écran principal » dans l'application.
+- Diagnostic indicatif lorsqu'une capture est presque totalement noire. Les images sont conservées.
+- Les touches F1 (photo), F2 (début/fin vidéo), l'encodeur NVENC expérimental et la bibliothèque restent inchangés.
+- La vidéo utilise encore FFmpeg `gdigrab` : le nouveau moteur C++ concerne **uniquement les photos**.
+- N'essaie pas de contourner les protections DRM : les contenus protégés peuvent être noirs.
+- Implémentation originale fondée sur les API Windows documentées, sans copie d'un dépôt tiers.
+
+### Tests sur Windows
+
+1. Choisir **Écran principal**, puis **Capture DirectX 11 (C++ / DXGI) [v6]**.
+2. Prendre une capture d'un bureau normal avec F1 ; vérifier le JPEG dans la galerie.
+3. Comparer avec le moteur natif GDI, Pillow et MSS.
+4. Si un message d'erreur ou une image noire apparaît, tester une fenêtre non protégée et relever le code d'erreur.
+5. Confirmer que F2 fonctionne encore pour une capture vidéo standard.
+
+La compilation Windows et les tests sur GPU réel doivent encore être validés dans GitHub Actions / sur PC.

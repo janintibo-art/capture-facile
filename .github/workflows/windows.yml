@@ -25,8 +25,11 @@ jobs:
           cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /Fe:capture_native.dll native\capture_native.cpp"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           if (-not (Test-Path capture_native.dll)) { throw "DLL native absente" }
+          cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /std:c++17 /Fe:capture_dxgi.dll native\capture_dxgi.cpp d3d11.lib dxgi.lib"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path capture_dxgi.dll)) { throw "DLL DirectX absente" }
       - name: Creer CaptureFacile.exe
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name CaptureFacile --collect-data customtkinter --collect-all imageio_ffmpeg --collect-all dxcam --collect-all mss --add-binary "capture_native.dll;." main.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name CaptureFacile --collect-data customtkinter --collect-all imageio_ffmpeg --collect-all dxcam --collect-all mss --add-binary "capture_native.dll;." --add-binary "capture_dxgi.dll;." main.py
       - name: Publier artefact EXE
         uses: actions/upload-artifact@v4
         with:
