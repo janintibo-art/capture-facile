@@ -16,8 +16,17 @@ jobs:
           python-version: '3.12'
       - name: Installer les dependances
         run: python -m pip install -r requirements.txt
+      - name: Compiler le moteur natif C++ (x64)
+        shell: pwsh
+        run: |
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Compilateur Visual C++ absent" }
+          $vcvars = Join-Path $vs "VC\Auxiliary\Build\vcvars64.bat"
+          cmd /c "`"$vcvars`" && cl /nologo /O2 /LD /EHsc /Fe:capture_native.dll native\capture_native.cpp"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path capture_native.dll)) { throw "DLL native absente" }
       - name: Creer CaptureFacile.exe
-        run: pyinstaller --noconfirm --clean --onefile --windowed --name CaptureFacile --collect-data customtkinter --collect-all imageio_ffmpeg --collect-all dxcam --collect-all mss main.py
+        run: pyinstaller --noconfirm --clean --onefile --windowed --name CaptureFacile --collect-data customtkinter --collect-all imageio_ffmpeg --collect-all dxcam --collect-all mss --add-binary "capture_native.dll;." main.py
       - name: Publier artefact EXE
         uses: actions/upload-artifact@v4
         with:

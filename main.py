@@ -1,5 +1,6 @@
 """Capture Facile — captures d'écran simples sous Windows."""
 import json
+import ctypes
 import os
 import queue
 import subprocess
@@ -19,7 +20,8 @@ from pynput import keyboard
 APP_NAME = "Capture Facile"
 CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile" / "settings.json"
 FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
-CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)"]
+CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)", "Capture Native (C++ / GDI)"]
+VIDEO_ENCODERS = ["CPU (H.264)", "NVIDIA NVENC (GPU)"]
 CAPTURE_TARGETS = ["Tous les écrans", "Écran principal"]
 HOTKEYS = {"Impr. écran": "print_screen", **{f"F{i}": f"f{i}" for i in range(1, 13)}}
 BG, PANEL, CARD, ACCENT, TEXT, MUTED = "#101523", "#1A2234", "#232E43", "#29D3B0", "#F2F5FF", "#A1B0CA"
@@ -46,7 +48,7 @@ def default_download_dir():
 
 
 def load_settings():
-    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0]}
+    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0], "video_encoder": VIDEO_ENCODERS[0]}
     try:
         settings = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
@@ -65,7 +67,42 @@ def load_settings():
         defaults["capture_engine"] = CAPTURE_ENGINES[0]
     if defaults["capture_target"] not in CAPTURE_TARGETS:
         defaults["capture_target"] = CAPTURE_TARGETS[0]
+    if defaults["video_encoder"] not in VIDEO_ENCODERS:
+        defaults["video_encoder"] = VIDEO_ENCODERS[0]
     return defaults
+
+
+def native_capture(target):
+    """Win32 capture implemented by our own C++ DLL, no Pillow/MSS/DXGI grabber.
+
+    Still uses the documented Win32 desktop API, respecting protected surfaces.
+    """
+    if sys.platform != "win32":
+        raise RuntimeError("Capture Native est uniquement disponible sur Windows.")
+    dll_path = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / "capture_native.dll"
+    if not dll_path.is_file():
+        raise RuntimeError("Moteur C++ absent de cet EXE. Vérifiez la compilation GitHub Actions.")
+    user32 = ctypes.windll.user32
+    if target == "Tous les écrans":
+        left = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+        top = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+        width = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+        height = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+    else:
+        left, top = 0, 0
+        width = user32.GetSystemMetrics(0)
+        height = user32.GetSystemMetrics(1)
+    if width <= 0 or height <= 0 or width * height > 100_000_000:
+        raise RuntimeError("Dimensions d’écran invalides.")
+    dll = ctypes.WinDLL(str(dll_path))
+    fn = dll.CaptureDesktopBGRA
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]
+    fn.restype = ctypes.c_int
+    buf = ctypes.create_string_buffer(width * height * 4)
+    error_code = fn(buf, left, top, width, height)
+    if error_code != 0:
+        raise RuntimeError(f"Capture Native Win32 indisponible (erreur {error_code}).")
+    return Image.frombytes("RGB", (width, height), buf.raw, "raw", "BGRX")
 
 
 def grab_with_engine(engine, target):
@@ -102,6 +139,8 @@ def grab_with_engine(engine, target):
         finally:
             if camera is not None:
                 camera.release()
+    if engine == CAPTURE_ENGINES[3]:
+        return native_capture(target)
     raise RuntimeError(f"Moteur inconnu : {engine}")
 
 
@@ -201,6 +240,15 @@ class CaptureApp(ctk.CTk):
         ctk.CTkOptionMenu(engine_row, values=CAPTURE_TARGETS, variable=self.target_var,
                           command=lambda value: self.change_capture_setting("capture_target", value),
                           width=150, fg_color=CARD, button_color="#344661").pack(side="left")
+        video_opts = ctk.CTkFrame(hero, fg_color="transparent")
+        video_opts.pack(fill="x", padx=24, pady=(0, 12))
+        self._label(video_opts, "ENCODAGE VIDÉO", 11, MUTED, "bold").pack(side="left", padx=(0, 9))
+        self.encoder_var = ctk.StringVar(value=self.settings["video_encoder"])
+        ctk.CTkOptionMenu(video_opts, values=VIDEO_ENCODERS, variable=self.encoder_var,
+                          command=lambda value: self.change_capture_setting("video_encoder", value),
+                          width=205, fg_color=CARD, button_color="#344661").pack(side="left")
+        self._label(video_opts, "NVENC nécessite un FFmpeg compatible et un pilote NVIDIA à jour.",
+                    11, MUTED).pack(side="left", padx=12)
         self._label(hero, "Modes réservés aux fenêtres capturables : les contenus protégés peuvent rester noirs.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
 
@@ -319,11 +367,19 @@ class CaptureApp(ctk.CTk):
             output = folder / f"video_{datetime.now():%Y-%m-%d_%H-%M-%S_%f}.mp4"
             ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
             # gdigrab captures the Windows desktop. Even resolutions are required by yuv420p.
+            use_nvenc = self.settings["video_encoder"] == VIDEO_ENCODERS[1]
+            codec_options = (["-c:v", "h264_nvenc", "-preset", "p4", "-cq", "23"]
+                             if use_nvenc else ["-c:v", "libx264", "-preset", "ultrafast", "-crf", "23"])
+            if use_nvenc:
+                check = subprocess.run([ffmpeg, "-hide_banner", "-encoders"],
+                                       capture_output=True, text=True, timeout=10,
+                                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if "h264_nvenc" not in check.stdout:
+                    raise RuntimeError("Ce FFmpeg n'inclut pas NVENC. Sélectionnez CPU (H.264).")
             command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
                        "-f", "gdigrab", "-framerate", "20", "-draw_mouse", "1", "-i", "desktop",
                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
-                       "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
-                       "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
+                       *codec_options, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
             log_path = CONFIG_FILE.parent / "ffmpeg-last.log"
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_file = log_path.open("wb")
@@ -401,7 +457,7 @@ class CaptureApp(ctk.CTk):
     def change_capture_setting(self, key, value):
         self.settings[key] = value
         self._save_settings()
-        self._set_status(f"Mode photo : {self.settings['capture_engine']} / {self.settings['capture_target']}")
+        self._set_status(f"Réglage sauvegardé : {value}")
 
     def change_hotkey(self, setting, value):
         other = "video_hotkey" if setting == "image_hotkey" else "image_hotkey"

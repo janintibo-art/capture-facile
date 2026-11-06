@@ -32,3 +32,13 @@ Application Windows 10/11 pour les captures photo et vidéo d’écran, interfac
 - Les méthodes capturent uniquement les surfaces autorisées par Windows ; aucune n'est conçue pour contourner une protection DRM.
 - Si une méthode échoue, un message d'erreur explique le problème. Les préférences sont sauvegardées.
 - Les dépendances `mss` et `dxcam` sont intégrées à l'EXE via PyInstaller.
+
+## v5 — Capture Native + encodage vidéo NVIDIA expérimental
+
+- Nouveau choix **Capture Native (C++ / GDI)**, compilé en DLL x64 par GitHub Actions et intégré à l'EXE.
+- Moteur Win32 BitBlt natif, indépendant du code de capture Pillow/MSS/DXGI ; toujours dépendant des API Windows et des autorisations graphiques.
+- Fonctionne avec écran principal et bureau multi-écrans.
+- Nouveau choix **CPU (H.264)** (défaut) ou **NVIDIA NVENC (GPU)** pour l'encodage vidéo.
+- NVENC est expérimental : l'FFmpeg fourni par imageio-ffmpeg peut ne pas contenir ce codec. Dans ce cas un message vous invite à choisir CPU ; le moteur vidéo reste `gdigrab`.
+- Les flux protégés (DRM) ne seront pas récupérés par le moteur natif.
+- **Vérification effectuée :** syntaxe Python et structure YAML, pas de compilation Windows locale.
