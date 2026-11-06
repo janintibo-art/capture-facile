@@ -18,6 +18,7 @@ from PIL import ImageTk, ImageOps
 import customtkinter as ctk
 from PIL import Image, ImageGrab
 from pynput import keyboard
+from trailer_studio import open_trailer_studio
 
 APP_NAME = "Capture Facile"
 CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile" / "settings.json"
@@ -385,6 +386,7 @@ class CaptureApp(ctk.CTk):
         self.count_label.pack(side="left", padx=13)
         self._button(actions, "Ouvrir le dossier", self.open_folder, width=156).pack(side="right", padx=(8, 0))
         self._button(actions, "Actualiser", self.refresh_gallery, width=110).pack(side="right")
+        self._button(actions, "🎬 Bande-annonce", self.open_trailer_studio, width=155).pack(side="right", padx=(0, 8))
 
         self.gallery = ctk.CTkScrollableFrame(self, fg_color=PANEL, corner_radius=16)
         self.gallery.pack(fill="both", expand=True, padx=28, pady=(0, 11))
@@ -395,6 +397,16 @@ class CaptureApp(ctk.CTk):
         self.status = self._label(bottom, "Prêt à capturer", 12, ACCENT)
         self.status.pack(side="left")
         self._label(bottom, "MP4 H.264 + AAC selon appareils • touches F1/F2", 11, MUTED).pack(side="right")
+
+    def open_trailer_studio(self):
+        if self.recording or self.finalizing_video:
+            messagebox.showwarning(APP_NAME, "Terminez la capture vidéo avant le montage.")
+            return
+        open_trailer_studio(self, self.settings["folder"], self._trailer_saved)
+
+    def _trailer_saved(self, path):
+        self.refresh_gallery()
+        self._set_status(f"✓ Bande-annonce créée : {path.name}")
 
     def _short_path(self):
         p = self.settings["folder"]
