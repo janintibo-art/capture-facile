@@ -1,4 +1,4 @@
-# Capture Facile — Windows (v3)
+# Capture Facile — Windows (v4)
 
 Application Windows 10/11 pour les captures photo et vidéo d’écran, interface sombre et gestionnaire de fichiers.
 
@@ -23,3 +23,12 @@ Application Windows 10/11 pour les captures photo et vidéo d’écran, interfac
 ## GitHub Actions
 
 À chaque push sur main, compilation Windows via PyInstaller. À chaque tag vN, publication de `CaptureFacile.exe` dans GitHub Releases. Cette v3 n'a pas été exécutée sur Windows dans l'environnement de création ; GitHub Actions puis un test sur PC restent nécessaires.
+
+## v4 — Choix du moteur de capture photo
+
+- Menu « MOTEUR PHOTO » : Pillow (API Windows), MSS (GDI), DXGI (DirectX).
+- Menu « ÉCRANS » : tous les écrans ou écran principal. Le mode DXGI v4 capture uniquement l'écran principal : choisir cette cible pour le tester.
+- F1 capture la photo selon le moteur choisi ; F2 garde l'enregistrement vidéo MP4 avec FFmpeg (gdigrab).
+- Les méthodes capturent uniquement les surfaces autorisées par Windows ; aucune n'est conçue pour contourner une protection DRM.
+- Si une méthode échoue, un message d'erreur explique le problème. Les préférences sont sauvegardées.
+- Les dépendances `mss` et `dxcam` sont intégrées à l'EXE via PyInstaller.

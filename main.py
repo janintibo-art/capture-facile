@@ -19,6 +19,8 @@ from pynput import keyboard
 APP_NAME = "Capture Facile"
 CONFIG_FILE = Path(os.environ.get("APPDATA", str(Path.home()))) / "CaptureFacile" / "settings.json"
 FORMATS = {"PNG": ".png", "JPEG": ".jpg"}
+CAPTURE_ENGINES = ["Pillow (Windows)", "MSS (Windows GDI)", "DXGI (DirectX)"]
+CAPTURE_TARGETS = ["Tous les écrans", "Écran principal"]
 HOTKEYS = {"Impr. écran": "print_screen", **{f"F{i}": f"f{i}" for i in range(1, 13)}}
 BG, PANEL, CARD, ACCENT, TEXT, MUTED = "#101523", "#1A2234", "#232E43", "#29D3B0", "#F2F5FF", "#A1B0CA"
 
@@ -44,7 +46,7 @@ def default_download_dir():
 
 
 def load_settings():
-    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG"}
+    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0]}
     try:
         settings = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
@@ -59,7 +61,48 @@ def load_settings():
         defaults["video_hotkey"] = "F2" if defaults["image_hotkey"] != "F2" else "F3"
     if defaults["format"] not in FORMATS:
         defaults["format"] = "JPEG"
+    if defaults["capture_engine"] not in CAPTURE_ENGINES:
+        defaults["capture_engine"] = CAPTURE_ENGINES[0]
+    if defaults["capture_target"] not in CAPTURE_TARGETS:
+        defaults["capture_target"] = CAPTURE_TARGETS[0]
     return defaults
+
+
+def grab_with_engine(engine, target):
+    """Capture ordinary desktop pixels; protected surfaces remain protected."""
+    all_screens = target == "Tous les écrans"
+    if engine == CAPTURE_ENGINES[0]:
+        return ImageGrab.grab(all_screens=all_screens)
+    if engine == CAPTURE_ENGINES[1]:
+        try:
+            import mss
+        except ImportError as exc:
+            raise RuntimeError("MSS n'est pas inclus dans cette compilation.") from exc
+        with mss.mss() as device:
+            # monitor 0 is the entire virtual desktop; monitor 1 is primary.
+            index = 0 if all_screens else 1
+            if index >= len(device.monitors):
+                raise RuntimeError("Moniteur introuvable.")
+            shot = device.grab(device.monitors[index])
+            return Image.frombytes("RGB", shot.size, shot.rgb)
+    if engine == CAPTURE_ENGINES[2]:
+        if all_screens:
+            raise RuntimeError("DXGI capture seulement l'écran principal dans cette version. Choisissez 'Écran principal'.")
+        try:
+            import dxcam
+        except ImportError as exc:
+            raise RuntimeError("DXGI n'est pas inclus dans cette compilation.") from exc
+        camera = None
+        try:
+            camera = dxcam.create(output_idx=0, output_color="RGB", backend="dxgi", processor_backend="numpy")
+            frame = camera.grab()
+            if frame is None:
+                raise RuntimeError("DirectX n'a fourni aucune image (écran indisponible ou protégé).")
+            return Image.fromarray(frame)
+        finally:
+            if camera is not None:
+                camera.release()
+    raise RuntimeError(f"Moteur inconnu : {engine}")
 
 
 class CaptureApp(ctk.CTk):
@@ -146,6 +189,21 @@ class CaptureApp(ctk.CTk):
         self._button(folder_row, "Modifier", self.choose_folder, width=85).pack(side="left")
         opts.grid_columnconfigure(3, weight=1)
 
+        engine_row = ctk.CTkFrame(hero, fg_color="transparent")
+        engine_row.pack(fill="x", padx=24, pady=(0, 17))
+        self._label(engine_row, "MOTEUR PHOTO", 11, MUTED, "bold").pack(side="left", padx=(0, 9))
+        self.engine_var = ctk.StringVar(value=self.settings["capture_engine"])
+        ctk.CTkOptionMenu(engine_row, values=CAPTURE_ENGINES, variable=self.engine_var,
+                          command=lambda value: self.change_capture_setting("capture_engine", value),
+                          width=190, fg_color=CARD, button_color="#344661").pack(side="left", padx=(0, 20))
+        self._label(engine_row, "ÉCRANS", 11, MUTED, "bold").pack(side="left", padx=(0, 9))
+        self.target_var = ctk.StringVar(value=self.settings["capture_target"])
+        ctk.CTkOptionMenu(engine_row, values=CAPTURE_TARGETS, variable=self.target_var,
+                          command=lambda value: self.change_capture_setting("capture_target", value),
+                          width=150, fg_color=CARD, button_color="#344661").pack(side="left")
+        self._label(hero, "Modes réservés aux fenêtres capturables : les contenus protégés peuvent rester noirs.",
+                    11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
+
         actions = ctk.CTkFrame(self, fg_color="transparent")
         actions.pack(fill="x", padx=30, pady=(0, 9))
         self._label(actions, "BIBLIOTHÈQUE PHOTO & VIDÉO", 17, TEXT, "bold").pack(side="left")
@@ -226,12 +284,14 @@ class CaptureApp(ctk.CTk):
         folder = Path(self.settings["folder"])
         suffix = FORMATS[self.settings["format"]]
         image_format = self.settings["format"]
+        engine = self.settings["capture_engine"]
+        target = self.settings["capture_target"]
 
         def job():
             try:
                 folder.mkdir(parents=True, exist_ok=True)
                 # all_screens=True covers extended Windows displays, not only the primary.
-                screenshot = ImageGrab.grab(all_screens=True)
+                screenshot = grab_with_engine(engine, target)
                 name = f"capture_{datetime.now():%Y-%m-%d_%H-%M-%S_%f}" + suffix
                 output = folder / name
                 if image_format == "JPEG":
@@ -337,6 +397,11 @@ class CaptureApp(ctk.CTk):
             finally:
                 self.events.put(("record_idle", None))
         threading.Thread(target=finalize, daemon=True).start()
+
+    def change_capture_setting(self, key, value):
+        self.settings[key] = value
+        self._save_settings()
+        self._set_status(f"Mode photo : {self.settings['capture_engine']} / {self.settings['capture_target']}")
 
     def change_hotkey(self, setting, value):
         other = "video_hotkey" if setting == "image_hotkey" else "image_hotkey"
