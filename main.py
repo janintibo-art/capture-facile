@@ -49,7 +49,7 @@ def default_download_dir():
 
 
 def load_settings():
-    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0], "video_encoder": VIDEO_ENCODERS[0]}
+    defaults = {"folder": str(default_download_dir()), "image_hotkey": "F1", "video_hotkey": "F2", "format": "JPEG", "capture_engine": CAPTURE_ENGINES[0], "capture_target": CAPTURE_TARGETS[0], "video_encoder": VIDEO_ENCODERS[0], "video_fps": "60", "video_region": ""}
     try:
         settings = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
         if isinstance(settings, dict):
@@ -70,6 +70,8 @@ def load_settings():
         defaults["capture_target"] = CAPTURE_TARGETS[0]
     if defaults["video_encoder"] not in VIDEO_ENCODERS:
         defaults["video_encoder"] = VIDEO_ENCODERS[0]
+    if defaults["video_fps"] not in ("30", "60", "120", "240"):
+        defaults["video_fps"] = "60"
     return defaults
 
 
@@ -218,6 +220,7 @@ class CaptureApp(ctk.CTk):
         self.video_log = None
         self.video_log_path = None
         self.current_images = []
+        self.video_region = None
         self.selected = None
         self.thumb_refs = []
         self.listener = None
@@ -304,8 +307,15 @@ class CaptureApp(ctk.CTk):
         ctk.CTkOptionMenu(video_opts, values=VIDEO_ENCODERS, variable=self.encoder_var,
                           command=lambda value: self.change_capture_setting("video_encoder", value),
                           width=205, fg_color=CARD, button_color="#344661").pack(side="left")
-        self._label(video_opts, "NVENC nécessite un FFmpeg compatible et un pilote NVIDIA à jour.",
-                    11, MUTED).pack(side="left", padx=12)
+        self._label(video_opts, "FPS", 11, MUTED, "bold").pack(side="left", padx=(14, 6))
+        self.fps_var = ctk.StringVar(value=self.settings["video_fps"])
+        ctk.CTkOptionMenu(video_opts, values=["30", "60", "120", "240"], variable=self.fps_var,
+                          command=lambda value: self.change_capture_setting("video_fps", value),
+                          width=82, fg_color=CARD, button_color="#344661").pack(side="left", padx=(0, 10))
+        self._button(video_opts, "Zone vidéo", self.select_video_region, width=105).pack(side="left", padx=4)
+        self._button(video_opts, "Écran entier", self.reset_video_region, width=105).pack(side="left", padx=4)
+        self._label(hero, "Vidéo v9 : 60 FPS conseillé. Zone optionnelle sur l'écran principal, encodage MP4 sans audio.",
+                    11, MUTED).pack(anchor="w", padx=24, pady=(0, 7))
         self._label(hero, "Éditeur v8 : recadrage et fonds d’écran. La capture de zone utilise Pillow (écran principal). Les contenus protégés peuvent rester noirs.",
                     11, MUTED).pack(anchor="w", padx=24, pady=(0, 13))
 
@@ -368,6 +378,14 @@ class CaptureApp(ctk.CTk):
             elif action == "record_idle":
                 self.finalizing_video = False
                 self.record_label.configure(text="●  Aucune vidéo en cours", text_color=MUTED)
+            elif action == "trim_done":
+                self.busy = False
+                self._set_status(f"✓ Extrait MP4 enregistré : {payload.name}")
+                self.refresh_gallery()
+            elif action == "trim_error":
+                self.busy = False
+                self._set_status(str(payload), True)
+                messagebox.showerror(APP_NAME, str(payload))
             elif action == "video_error":
                 self._set_status(str(payload), True)
                 messagebox.showerror(APP_NAME, str(payload))
@@ -434,8 +452,23 @@ class CaptureApp(ctk.CTk):
                                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 if "h264_nvenc" not in check.stdout:
                     raise RuntimeError("Ce FFmpeg n'inclut pas NVENC. Sélectionnez CPU (H.264).")
+            # A video region is applied by gdigrab, not by cropping a finished MP4.
+            fps = int(self.settings.get("video_fps", "60"))
+            region = self.video_region
+            capture_args = []
+            if region is not None:
+                left, top, right, bottom = region
+                width, height = right - left, bottom - top
+                # H.264 4:2:0 requires even dimensions.
+                width -= width % 2
+                height -= height % 2
+                if width < 16 or height < 16:
+                    raise RuntimeError("La zone vidéo doit mesurer au moins 16 × 16 pixels.")
+                capture_args = ["-offset_x", str(left), "-offset_y", str(top),
+                                "-video_size", f"{width}x{height}"]
             command = [ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                       "-f", "gdigrab", "-framerate", "20", "-draw_mouse", "1", "-i", "desktop",
+                       "-f", "gdigrab", "-framerate", str(fps), "-draw_mouse", "1",
+                       *capture_args, "-i", "desktop",
                        "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
                        *codec_options, "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output)]
             log_path = CONFIG_FILE.parent / "ffmpeg-last.log"
@@ -601,13 +634,137 @@ class CaptureApp(ctk.CTk):
             row.pack(pady=(7, 10))
             ctk.CTkButton(row, text="Ouvrir", command=lambda p=path: self.open_image(p), width=52, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="Renommer", command=lambda p=path: self.rename_image(p), width=76, height=28, fg_color="#33455E").pack(side="left", padx=2)
-            if path.suffix.lower() != ".mp4":
+            if path.suffix.lower() == ".mp4":
+                ctk.CTkButton(row, text="Couper", command=lambda p=path: self.trim_video(p), width=53, height=28, fg_color="#33455E").pack(side="left", padx=2)
+            else:
                 ctk.CTkButton(row, text="Éditer", command=lambda p=path: self.edit_image(p), width=48, height=28, fg_color="#33455E").pack(side="left", padx=2)
             ctk.CTkButton(row, text="×", command=lambda p=path: self.delete_image(p), width=27, height=28, fg_color="#6C3548", hover_color="#AA4058").pack(side="left", padx=2)
         for col in range(cols):
             self.gallery.grid_columnconfigure(col, weight=1)
         if len(self.current_images) > 180:
             self._label(self.gallery, "180 images affichées. Ouvrez le dossier pour voir les autres.", 11, MUTED).grid(row=(180 // cols) + 1, column=0, columnspan=cols, pady=12)
+
+    def reset_video_region(self):
+        if self.recording:
+            self._set_status("Arrêtez la vidéo pour modifier la zone.", True)
+            return
+        self.video_region = None
+        self._set_status("Vidéo : écran entier sélectionné")
+
+    def select_video_region(self):
+        if self.busy or self.recording or self.finalizing_video:
+            self._set_status("Terminez l'opération en cours avant de choisir une zone.", True)
+            return
+        self.busy = True
+        self.withdraw()
+        self.after(350, self._show_video_region_overlay)
+
+    def _show_video_region_overlay(self):
+        try:
+            image = ImageGrab.grab()
+            overlay = Toplevel(self)
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            overlay.geometry(f"{image.width}x{image.height}+0+0")
+            canvas = Canvas(overlay, width=image.width, height=image.height,
+                            highlightthickness=0, cursor="crosshair")
+            canvas.pack(fill="both", expand=True)
+            preview = ImageTk.PhotoImage(image)
+            canvas.image_ref = preview
+            canvas.create_image(0, 0, image=preview, anchor="nw")
+            canvas.create_rectangle(0, 0, image.width, 36, fill="#142035", outline="")
+            canvas.create_text(14, 18, anchor="w", fill="white",
+                               text="ZONE VIDÉO — glissez pour sélectionner, Échap pour annuler")
+            state = {"start": None, "rectangle": None, "done": False}
+
+            def close():
+                overlay.destroy()
+                self.deiconify()
+                self.busy = False
+
+            def cancel(_event=None):
+                if not state["done"]:
+                    state["done"] = True
+                    close()
+                    self._set_status("Sélection vidéo annulée")
+
+            def press(event):
+                state["start"] = (event.x, event.y)
+                if state["rectangle"]:
+                    canvas.delete(state["rectangle"])
+                state["rectangle"] = canvas.create_rectangle(event.x, event.y, event.x, event.y,
+                                                                outline="#29D3B0", width=3)
+
+            def drag(event):
+                if state["start"]:
+                    x, y = state["start"]
+                    canvas.coords(state["rectangle"], x, y, event.x, event.y)
+
+            def finish(event):
+                if state["done"] or not state["start"]:
+                    return
+                x, y = state["start"]
+                rect = (max(0, min(x, event.x)), max(0, min(y, event.y)),
+                        min(image.width, max(x, event.x)), min(image.height, max(y, event.y)))
+                if rect[2] - rect[0] < 16 or rect[3] - rect[1] < 16:
+                    return
+                state["done"] = True
+                self.video_region = rect
+                close()
+                self._set_status(f"Zone vidéo sélectionnée : {rect[2]-rect[0]} × {rect[3]-rect[1]} pixels")
+
+            canvas.bind("<ButtonPress-1>", press)
+            canvas.bind("<B1-Motion>", drag)
+            canvas.bind("<ButtonRelease-1>", finish)
+            overlay.bind("<Escape>", cancel)
+            overlay.focus_force()
+        except Exception as exc:
+            self.deiconify()
+            self.busy = False
+            messagebox.showerror(APP_NAME, f"Sélection de zone impossible : {exc}")
+
+    def trim_video(self, path):
+        """Non-destructive MP4 trim with explicit start/end times (seconds)."""
+        if self.busy or self.recording or self.finalizing_video:
+            self._set_status("Terminez l'opération en cours avant de couper une vidéo.", True)
+            return
+        from tkinter import simpledialog
+        begin = simpledialog.askfloat("Découper une vidéo", "Début en secondes (ex : 3.5) :",
+                                      parent=self, minvalue=0.0)
+        if begin is None:
+            return
+        end = simpledialog.askfloat("Découper une vidéo", "Fin en secondes (ex : 18.0) :",
+                                    parent=self, minvalue=0.0)
+        if end is None:
+            return
+        if end <= begin:
+            messagebox.showwarning(APP_NAME, "La fin doit être supérieure au début.", parent=self)
+            return
+        self.busy = True
+        self._set_status("Export de l'extrait MP4 en cours…")
+
+        def job():
+            try:
+                dest = path.with_name(path.stem + "_extrait.mp4")
+                index = 2
+                while dest.exists():
+                    dest = path.with_name(f"{path.stem}_extrait_{index}.mp4")
+                    index += 1
+                ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+                cmd = [ffmpeg, "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-ss", str(begin), "-i", str(path), "-t", str(end - begin),
+                       "-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                       "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dest)]
+                completed = subprocess.run(cmd, capture_output=True, text=True,
+                                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                if completed.returncode != 0 or not dest.exists() or not dest.stat().st_size:
+                    if dest.exists():
+                        dest.unlink()
+                    raise RuntimeError((completed.stderr or "Export vidéo impossible")[-700:])
+                self.events.put(("trim_done", dest))
+            except Exception as exc:
+                self.events.put(("trim_error", f"Découpage impossible : {exc}"))
+        threading.Thread(target=job, daemon=True).start()
 
     def capture_zone(self):
         """Zone interactive sur l'écran principal : source Pillow, pas de contournement DRM."""
