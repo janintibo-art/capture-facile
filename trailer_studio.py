@@ -12,6 +12,7 @@ import tempfile
 import threading
 from datetime import datetime
 from pathlib import Path
+from io import BytesIO
 from tkinter import Listbox, END, SINGLE, filedialog, messagebox
 
 import customtkinter as ctk
@@ -154,9 +155,9 @@ def export_trailer(clips, output, title, music, resolution, fps, on_progress,
 class TrailerStudio(ctk.CTkToplevel):
     def __init__(self, master, folder, on_saved):
         super().__init__(master)
-        self.title('Capture Facile • Atelier bande-annonce v13')
-        self.geometry('1050x825')
-        self.minsize(850, 730)
+        self.title('Capture Facile • Atelier bande-annonce v14')
+        self.geometry('1130x875')
+        self.minsize(900, 720)
         self.configure(fg_color=BG)
         self.folder = Path(folder)
         self.on_saved = on_saved
@@ -169,6 +170,13 @@ class TrailerStudio(ctk.CTkToplevel):
         self.preview_photo = None
         self.preview_clip = None
         self.updates = queue.Queue()
+        self.thumb_cache = {}
+        self.thumb_pending = set()
+        self.thumb_refs = {}
+        self.timeline_widgets = {}
+        self.timeline_cards = []
+        self.drag_source = None
+        self.thumb_semaphore = threading.Semaphore(2)
         self._build()
         self.after(100, self._poll)
         self.after(120, self.lift)
@@ -176,7 +184,7 @@ class TrailerStudio(ctk.CTkToplevel):
     def _build(self):
         ctk.CTkLabel(self, text='ATELIER BANDE-ANNONCE', font=('Segoe UI', 24, 'bold'),
                      text_color=TEXT).pack(anchor='w', padx=24, pady=(22, 4))
-        ctk.CTkLabel(self, text='Choisissez les vidéos, organisez les scènes, ajoutez un titre et exportez.',
+        ctk.CTkLabel(self, text='Ajoutez des vidéos, déplacez leurs miniatures à la souris et exportez votre montage.',
                      text_color=MUTED).pack(anchor='w', padx=24, pady=(0, 16))
         panel = ctk.CTkFrame(self, fg_color=PANEL, corner_radius=16)
         panel.pack(fill='both', expand=True, padx=24, pady=(0, 10))
@@ -186,7 +194,15 @@ class TrailerStudio(ctk.CTkToplevel):
         self.listbox = Listbox(panel, height=5, selectmode=SINGLE, bg='#232E43', fg='#F2F5FF',
                                selectbackground='#247D78', selectforeground='#FFFFFF',
                                borderwidth=0, highlightthickness=0, font=('Segoe UI', 11))
-        self.listbox.pack(fill='x', padx=18, pady=(0, 8))
+        # Keep Listbox as selection model for v13 actions; v14 shows visual timeline instead.
+        self.timeline = ctk.CTkScrollableFrame(panel, orientation='horizontal',
+                                                fg_color=CARD, height=132,
+                                                corner_radius=12)
+        self.timeline.pack(fill='x', padx=18, pady=(0, 8))
+        self.timeline_hint = ctk.CTkLabel(self.timeline,
+                            text='Ajoutez des MP4 puis glissez une miniature pour réorganiser les scènes.',
+                            text_color=MUTED)
+        self.timeline_hint.pack(side='left', padx=12, pady=40)
         self.listbox.bind('<<ListboxSelect>>', self._preview_selection)
         buttons = ctk.CTkFrame(panel, fg_color='transparent')
         buttons.pack(fill='x', padx=14, pady=(0, 10))
@@ -198,12 +214,12 @@ class TrailerStudio(ctk.CTkToplevel):
         viewing = ctk.CTkFrame(panel, fg_color=CARD, corner_radius=10)
         viewing.pack(fill='x', padx=18, pady=(0, 8))
         self.preview_label = ctk.CTkLabel(viewing, text='Choisissez un clip pour voir son aperçu',
-                                           width=480, height=270, text_color=MUTED)
+                                           width=600, height=338, text_color=MUTED)
         self.preview_label.pack(side='left', padx=10, pady=8)
         player = ctk.CTkFrame(viewing, fg_color='transparent')
         player.pack(side='left', fill='both', expand=True, padx=8)
         self.preview_name = ctk.CTkLabel(player, text='Lecture d’aperçu sans son',
-                                          text_color=MUTED, wraplength=310)
+                                          text_color=MUTED, wraplength=210)
         self.preview_name.pack(anchor='w', pady=12)
         ctk.CTkButton(player, text='▶ Lire', command=self.play_preview,
                       fg_color=ACCENT, text_color=BG, width=130).pack(anchor='w', pady=4)
@@ -278,6 +294,7 @@ class TrailerStudio(ctk.CTkToplevel):
         if not selected:
             return
         chosen = self.clips[selected[0]]
+        self._highlight_timeline()
         if chosen == self.preview_clip:
             return
         self._stop_player()
@@ -304,7 +321,7 @@ class TrailerStudio(ctk.CTkToplevel):
             proc = None
             try:
                 ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-                width, height = 480, 270
+                width, height = 600, 338
                 cmd = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin', '-i', str(path),
                        '-an', '-vf', f'fps=12,scale={width}:{height}:force_original_aspect_ratio=decrease,'
                        f'pad={width}:{height}:(ow-iw)/2:(oh-ih)/2',
@@ -346,6 +363,119 @@ class TrailerStudio(ctk.CTkToplevel):
                         pass
         threading.Thread(target=play, daemon=True).start()
 
+
+    def _queue_thumbnail(self, path):
+        """Decode one small thumbnail outside Tk main thread."""
+        if path in self.thumb_cache or path in self.thumb_pending:
+            return
+        self.thumb_pending.add(path)
+        def work():
+            picture = None
+            with self.thumb_semaphore:
+                try:
+                    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+                    args = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin',
+                            '-ss', '0.35', '-i', str(path), '-frames:v', '1',
+                            '-vf', 'scale=160:90:force_original_aspect_ratio=decrease,'
+                            'pad=160:90:(ow-iw)/2:(oh-ih)/2:black',
+                            '-f', 'image2pipe', '-vcodec', 'mjpeg', '-']
+                    result = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                            timeout=18, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+                    if result.returncode == 0 and result.stdout:
+                        with Image.open(BytesIO(result.stdout)) as im:
+                            picture = im.convert('RGB')
+                except (OSError, ValueError, subprocess.TimeoutExpired):
+                    pass
+            self.updates.put(('thumb_ready', (path, picture)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _render_timeline(self):
+        if not hasattr(self, 'timeline'):
+            return
+        for child in self.timeline.winfo_children():
+            child.destroy()
+        self.timeline_widgets.clear()
+        self.timeline_cards.clear()
+        self.thumb_refs.clear()
+        if not self.clips:
+            label = ctk.CTkLabel(self.timeline, text='Ajoutez des vidéos MP4 pour créer votre première séquence.',
+                                 text_color=MUTED)
+            label.pack(side='left', padx=16, pady=40)
+            return
+        selection = self.listbox.curselection()
+        active = selection[0] if selection else -1
+        for i, path in enumerate(self.clips):
+            card = ctk.CTkFrame(self.timeline, width=170, height=120, corner_radius=9,
+                                fg_color='#225A61' if i == active else PANEL,
+                                border_width=2 if i == active else 0,
+                                border_color=ACCENT)
+            card.pack(side='left', padx=5, pady=4)
+            card.pack_propagate(False)
+            image = self.thumb_cache.get(path)
+            if image:
+                picture = ctk.CTkImage(light_image=image, dark_image=image, size=(160, 90))
+                self.thumb_refs[path] = picture
+                visual = ctk.CTkLabel(card, text='', image=picture, width=160, height=90)
+            else:
+                visual = ctk.CTkLabel(card, text='▶  VIDÉO', width=160, height=90,
+                                       text_color=ACCENT)
+                self._queue_thumbnail(path)
+            visual.pack(pady=(3, 0))
+            caption = ctk.CTkLabel(card, text=f'{i+1:02d}  {path.name[:19]}',
+                                    font=('Segoe UI', 10), text_color=TEXT, width=160)
+            caption.pack(pady=(0, 2))
+            self.timeline_cards.append(card)
+            for widget in (card, visual, caption):
+                self.timeline_widgets[widget] = i
+                widget.bind('<ButtonPress-1>', self._timeline_press)
+                widget.bind('<ButtonRelease-1>', self._timeline_release)
+
+    def _highlight_timeline(self):
+        if not hasattr(self, 'timeline_cards'):
+            return
+        selection = self.listbox.curselection()
+        active = selection[0] if selection else -1
+        for i, card in enumerate(self.timeline_cards):
+            try:
+                card.configure(fg_color='#225A61' if i == active else PANEL,
+                               border_width=2 if i == active else 0)
+            except Exception:
+                pass
+
+    def _timeline_press(self, event):
+        self.drag_source = self.timeline_widgets.get(event.widget)
+        if self.drag_source is not None:
+            self.listbox.selection_clear(0, END)
+            self.listbox.selection_set(self.drag_source)
+            self.listbox.see(self.drag_source)
+            self._preview_selection()
+
+    def _timeline_release(self, event):
+        start = self.drag_source
+        self.drag_source = None
+        if start is None or start >= len(self.clips) or self.running:
+            return
+        # Determine target from the position of the mouse over the timeline.
+        if not self.timeline_cards:
+            return
+        x, y = event.x_root, event.y_root
+        cards = self.timeline_cards
+        if not (cards[0].winfo_rooty() - 10 <= y <= cards[0].winfo_rooty() + cards[0].winfo_height() + 10):
+            return
+        candidates = [(abs(x - (c.winfo_rootx() + c.winfo_width()/2)), i)
+                      for i, c in enumerate(cards)]
+        if not candidates:
+            return
+        target = min(candidates)[1]
+        if start != target:
+            item = self.clips.pop(start)
+            self.clips.insert(target, item)
+            self._refresh(target)
+            self._preview_selection()
+            self.status.configure(text=f'Scène déplacée en position {target+1}')
+        else:
+            self._highlight_timeline()
+
     def _refresh(self, selected=None):
         self.listbox.delete(0, END)
         for i, p in enumerate(self.clips):
@@ -354,6 +484,7 @@ class TrailerStudio(ctk.CTkToplevel):
             pos = min(max(selected,0),len(self.clips)-1)
             self.listbox.selection_set(pos)
             self.listbox.see(pos)
+        self._render_timeline()
 
     def add_clips(self):
         chosen = filedialog.askopenfilenames(parent=self, title='Choisir les vidéos MP4',
@@ -390,6 +521,7 @@ class TrailerStudio(ctk.CTkToplevel):
         self.preview_clip = None
         self.clips.clear()
         self._refresh()
+        self._render_timeline()
 
     def select_music(self):
         source = filedialog.askopenfilename(parent=self, title='Choisir une musique',
@@ -455,6 +587,12 @@ class TrailerStudio(ctk.CTkToplevel):
         try:
             while True:
                 kind, value = self.updates.get_nowait()
+                if kind == 'thumb_ready':
+                    path, pic = value
+                    self.thumb_pending.discard(path)
+                    self.thumb_cache[path] = pic
+                    self._render_timeline()
+                    continue
                 if kind == 'preview_frame':
                     generation, frame, t = value
                     if generation == self.preview_generation:
